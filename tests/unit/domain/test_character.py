@@ -82,7 +82,8 @@ class TestCharacter:
         ch = Character(char="a", check_count=3)
         ch.add_timestamp(1000, checkpoint_idx=0)
         ch.add_timestamp(3000, checkpoint_idx=2)
-        assert ch.timestamps == [1000, 0, 3000]
+        # 稀疏空位回填前一 cp 时间戳，不再产生 0ms 伪时间戳（C2）
+        assert ch.timestamps == [1000, 1000, 3000]
 
     def test_remove_timestamp_at(self):
         ch = Character(char="a", check_count=3, timestamps=[1000, 2000, 3000])
@@ -166,3 +167,46 @@ class TestCharacter:
         # Rest char
         ch_rest = Character(char=" ", is_rest=True)
         assert ch_rest.get_tag_type(0) == TimeTagType.REST
+
+
+class TestSparseTimestampFill:
+    """稀疏打轴写入 add_timestamp 的空位回填规约（C2）。"""
+
+    def test_gap_filled_with_previous_timestamp(self):
+        """跳位写入：中间空位用前一 cp 的时间戳回填，不再产生 0ms"""
+        ch = Character(char="あ", check_count=3)
+        ch.add_timestamp(1000, 0)
+        ch.add_timestamp(3000, 2)
+
+        assert ch.timestamps == [1000, 1000, 3000]
+        assert ch.get_timestamp(1) == 1000
+
+    def test_sparse_write_without_previous_rejected(self):
+        """目标位之前无任何时间戳（无法回填）：拒绝写入"""
+        ch = Character(char="あ", check_count=2)
+        with pytest.raises(ValidationError, match="稀疏打轴被拒绝"):
+            ch.add_timestamp(500, 1)
+        # 拒绝时不产生任何写入
+        assert ch.timestamps == []
+
+    def test_sequential_first_write_unchanged(self):
+        """首写（len == checkpoint_idx == 0）与顺序追加行为不变"""
+        ch = Character(char="あ", check_count=2)
+        ch.add_timestamp(500, 0)
+        ch.add_timestamp(900, 1)
+        assert ch.timestamps == [500, 900]
+
+    def test_append_semantics_unchanged(self):
+        """checkpoint_idx=-1 追加语义不变"""
+        ch = Character(char="あ", check_count=2)
+        ch.add_timestamp(500)
+        ch.add_timestamp(900)
+        assert ch.timestamps == [500, 900]
+
+    def test_overwrite_existing_slot_unchanged(self):
+        """覆写已有槽位不受影响"""
+        ch = Character(char="あ", check_count=2)
+        ch.add_timestamp(500, 0)
+        ch.add_timestamp(900, 1)
+        ch.add_timestamp(700, 0)
+        assert ch.timestamps == [700, 900]

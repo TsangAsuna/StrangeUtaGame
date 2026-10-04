@@ -9,6 +9,7 @@ from strange_uta_game.backend.domain.models import (
 )
 from strange_uta_game.backend.domain.entities import Sentence
 from strange_uta_game.backend.infrastructure.parsers.inline_format import (
+    _TAG_RE,
     format_timestamp,
     parse_timestamp,
     encode_check_n,
@@ -285,7 +286,9 @@ class TestToInlineText:
         result = to_inline_text(sentence)
         assert result == "[1|00:10:00]x[10|00:12:00]"
 
-    def test_normal_char_export_uses_first_checkpoint(self):
+    def test_normal_char_export_uses_all_checkpoints(self):
+        """F1：N 按 check_count 输出，其余时间戳用无前缀 [ts] 补充标签，
+        多拍字符 round-trip 不丢节奏点。"""
         sentence = _make_sentence(
             "x",
             characters=[
@@ -295,7 +298,26 @@ class TestToInlineText:
             ],
         )
         result = to_inline_text(sentence)
-        assert result == "[1|00:01:00]x"
+        assert result == "[2|00:01:00]x[00:02:00]"
+        restored = from_inline_text(result, singer_id="s1")
+        assert restored.characters[0].check_count == 2
+        assert restored.characters[0].timestamps == [1000, 2000]
+
+    def test_normal_char_export_caps_n_at_nine(self):
+        """N 与停顿点标记 [10] 冲突，与 ruby node 路径一致封顶 9。"""
+        sentence = _make_sentence(
+            "x",
+            characters=[
+                Character(
+                    char="x",
+                    check_count=12,
+                    timestamps=list(range(1000, 13000, 1000)),
+                    singer_id="s1",
+                )
+            ],
+        )
+        result = to_inline_text(sentence)
+        assert result.startswith("[9|")
 
     def test_ruby_single_char(self):
         sentence = _make_sentence(
@@ -574,3 +596,182 @@ class TestRoundtrip:
         assert len(restored) == 2
         assert restored[0].chars == ["あ"]
         assert restored[1].chars == ["い"]
+
+
+# ──────────────────────────────────────────────
+# E4 / E7 / F1 / F4 / F11 / F15 回归
+# ──────────────────────────────────────────────
+
+
+class TestMalformedInputE4:
+    """E4：反序列化对畸形输入降级处理，不抛裸 ValueError。"""
+
+    def test_unclosed_brace_degrades_to_plain_text(self):
+        sentence = from_inline_text("{未闭合[1|00:00:01]x", singer_id="s1")
+        assert "".join(sentence.chars) == "{未闭合x"
+
+    def test_ruby_group_without_pipe_degrades_to_plain(self):
+        sentence = from_inline_text("[1|00:00:01]あ{abc}[1|00:00:02]い", singer_id="s1")
+        assert sentence.chars == ["あ", "a", "b", "c", "い"]
+
+    def test_decode_check_n_accepts_e_suffix(self):
+        assert decode_check_n("1e") == (1, False, False)
+        assert decode_check_n("10e") == (1, True, False)
+
+    def test_decode_check_n_raises_parse_error_on_garbage(self):
+        from strange_uta_game.backend.infrastructure.parsers.lyric_parser import (
+            ParseError,
+        )
+
+        with pytest.raises(ParseError):
+            decode_check_n("xyz")
+
+    def test_ruby_group_with_garbage_n_degrades(self):
+        # `[zz]` 不匹配 _TAG_NO_TS_RE（\d+e?），整个 portion 按无 checkpoint 处理
+        sentence = from_inline_text("{漢|[2]かん}", singer_id="s1")
+        assert sentence.chars == ["漢"]
+        assert sentence.characters[0].check_count == 2
+
+
+class TestBareCharsKeptE7:
+    """E7：_parse_plain_segment 保留所有非 tag 裸字符（与导出对称）。"""
+
+    def test_musical_note_and_full_width_space_kept(self):
+        sentence = from_inline_text("♪\u3000[1|00:00:01]あ", singer_id="s1")
+        assert [c.char for c in sentence.characters] == ["♪", "\u3000", "あ"]
+        assert [c.check_count for c in sentence.characters] == [0, 0, 1]
+
+    def test_plain_only_line_round_trips(self):
+        original = from_inline_text("ただの文章", singer_id="s1")
+        assert original.text == "ただの文章"
+
+        exported = to_inline_text(original)
+        restored = from_inline_text(exported, singer_id="s1")
+        assert restored.text == "ただの文章"
+
+    def test_bare_rest_char_is_rest(self):
+        sentence = from_inline_text("あ▨い", singer_id="s1")
+        assert [c.is_rest for c in sentence.characters] == [False, True, False]
+
+
+class TestUntimedRubySegmentsF4:
+    """F4：无 ts 的 ruby part 用 [N] 型分隔导出，分段与 cc=0 可往返。"""
+
+    def test_untimed_multi_part_ruby_round_trip(self):
+        original = Character(
+            char="漢",
+            check_count=2,
+            timestamps=[],
+            ruby=Ruby(parts=[RubyPart(text="か"), RubyPart(text="ん")]),
+            singer_id="s1",
+        )
+        text = to_inline_text(_make_sentence("漢", characters=[original]))
+        assert text == "{漢|[2]か[2]ん}"
+
+        restored = from_inline_text(text, singer_id="s1")
+        ch = restored.characters[0]
+        assert ch.check_count == 2
+        assert [p.text for p in ch.ruby.parts] == ["か", "ん"]
+
+    def test_cc0_ruby_whole_reading_round_trip(self):
+        original = Character(
+            char="漢",
+            check_count=0,
+            timestamps=[],
+            ruby=Ruby(parts=[RubyPart(text="かな")]),
+            singer_id="s1",
+        )
+        text = to_inline_text(_make_sentence("漢", characters=[original]))
+        assert text == "{漢|[0]かな}"
+
+        restored = from_inline_text(text, singer_id="s1")
+        ch = restored.characters[0]
+        assert ch.check_count == 0
+        assert [p.text for p in ch.ruby.parts] == ["かな"]
+
+    def test_partial_ts_ruby_parts_not_merged(self):
+        """有 ts 的路径：缺 ts 的拍输出 [N] 型分隔，不与前一拍合并。"""
+        original = Character(
+            char="漢",
+            check_count=3,
+            timestamps=[5000],
+            ruby=Ruby(parts=[RubyPart(text="か"), RubyPart(text="ん"), RubyPart(text="ぬ")]),
+            singer_id="s1",
+        )
+        text = to_inline_text(_make_sentence("漢", characters=[original]))
+        assert text == "{漢|[3|00:05:00]か[3]ん[3]ぬ}"
+
+        restored = from_inline_text(text, singer_id="s1")
+        ch = restored.characters[0]
+        assert ch.check_count == 3
+        assert [p.text for p in ch.ruby.parts] == ["か", "ん", "ぬ"]
+        assert ch.timestamps == [5000]
+
+
+class TestLinkedGroupRubyNodeF1:
+    """F1：含 cc>0 成员的无注音连词组走 ruby node 路径，
+    连词关系与多 cp 节奏点 round-trip 不丢。"""
+
+    def test_non_ruby_linked_group_multi_cp_round_trip(self):
+        a = Character(char="あ", check_count=1, timestamps=[1000], singer_id="s1")
+        a.linked_to_next = True
+        b = Character(char="い", check_count=1, timestamps=[2000], singer_id="s1")
+        text = to_inline_text(_make_sentence("あい", characters=[a, b]))
+        assert text == "{あい|[1|00:01:00]＋[1|00:02:00]}"
+
+        restored = from_inline_text(text, singer_id="s1")
+        assert [c.char for c in restored.characters] == ["あ", "い"]
+        assert [c.check_count for c in restored.characters] == [1, 1]
+        assert [c.timestamps for c in restored.characters] == [[1000], [2000]]
+        assert restored.characters[0].linked_to_next is True
+
+    def test_all_cc0_group_stays_normal_node(self):
+        a = Character(char="あ", check_count=0, singer_id="s1")
+        a.linked_to_next = True
+        b = Character(char="い", check_count=0, singer_id="s1")
+        text = to_inline_text(_make_sentence("あい", characters=[a, b]))
+        assert text == "あい"
+
+
+class TestReservedCharEscapeF11:
+    """F11：正文保留字符 { } | 导出替换为全角形近字，导入映射回来。"""
+
+    def test_brace_pipe_round_trip(self):
+        chars = [Character(char=ch, check_count=0, singer_id="s1") for ch in "a{b|c}d"]
+        text = to_inline_text(_make_sentence("a{b|c}d", characters=chars))
+        assert "{" not in text and "}" not in text and "|" not in text
+
+        restored = from_inline_text(text, singer_id="s1")
+        assert [c.char for c in restored.characters] == list("a{b|c}d")
+
+    def test_reserved_char_in_ruby_text(self):
+        original = Character(
+            char="漢",
+            check_count=1,
+            timestamps=[1000],
+            ruby=Ruby(parts=[RubyPart(text="か|ん")]),
+            singer_id="s1",
+        )
+        text = to_inline_text(_make_sentence("漢", characters=[original]))
+        restored = from_inline_text(text, singer_id="s1")
+        assert restored.characters[0].ruby.text == "か|ん"
+
+
+class TestWideMinuteTimestampF15:
+    """F15：分钟 ≥100 的时间戳（长曲）导出后能被自家 _TAG_RE 读回。"""
+
+    def test_format_100_minutes_matches_tag_re(self):
+        ts_str = format_timestamp(6_000_000)  # 100 分钟
+        assert ts_str == "100:00:00"
+        assert _TAG_RE.match(f"[{ts_str}]")
+
+    def test_round_trip_long_song(self):
+        original = Character(
+            char="あ",
+            check_count=1,
+            timestamps=[6_000_000],
+            singer_id="s1",
+        )
+        text = to_inline_text(_make_sentence("あ", characters=[original]))
+        restored = from_inline_text(text, singer_id="s1")
+        assert restored.characters[0].timestamps == [6_000_000]

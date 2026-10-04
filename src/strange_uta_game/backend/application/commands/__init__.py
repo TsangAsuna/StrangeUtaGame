@@ -4,6 +4,7 @@ from .base import Command, BatchCommand, CommandState
 from .domain_commands import (
     AddTimeTagCommand,
     RemoveTimeTagCommand,
+    SetTimestampCommand,
     ClearLineTimeTagsCommand,
     UpdateCharacterCommand,
     AddRubyCommand,
@@ -12,6 +13,7 @@ from .domain_commands import (
     RemoveSentenceCommand,
     AddSingerCommand,
     RemoveSingerCommand,
+    TagAndDeleteNextCommand,
 )
 from .sentence_snapshot import SentenceSnapshotCommand
 
@@ -21,6 +23,7 @@ __all__ = [
     "CommandState",
     "AddTimeTagCommand",
     "RemoveTimeTagCommand",
+    "SetTimestampCommand",
     "ClearLineTimeTagsCommand",
     "UpdateCharacterCommand",
     "AddRubyCommand",
@@ -29,5 +32,6 @@ __all__ = [
     "RemoveSentenceCommand",
     "AddSingerCommand",
     "RemoveSingerCommand",
+    "TagAndDeleteNextCommand",
     "SentenceSnapshotCommand",
 ]

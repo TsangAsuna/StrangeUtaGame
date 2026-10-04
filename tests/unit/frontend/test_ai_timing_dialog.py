@@ -193,6 +193,10 @@ class TestPathChangeAppliesImmediately:
     def test_busy_blocks_path_change(self, qapp, tmp_path, monkeypatch):
         snap = _ready_snapshot()
         dialog, service = _make_dialog(qapp, tmp_path, snap, [])
+        # 先等构造期异步 refresh 收尾：否则本测试对 dialog 的引用随
+        # 用例结束被 GC，会命中「QThread 以对话框为父 + 线程仍在跑」
+        # 的销毁竞态（高负载下挂死整个进程）
+        self._wait_initial_refresh(qapp, dialog)
         dialog._busy = True
         self._pick(monkeypatch, tmp_path / "elsewhere")
         dialog._on_change_model_dir()
@@ -904,3 +908,170 @@ class TestDownloadMirrorApplied:
         dialog._on_reset_settings()
         assert dialog._settings.download_mirror == ""
         assert dialog.combo_mirror.currentIndex() == 0
+
+
+class TestTaskGuardsAndTeardown:
+    """H11/H14/G2：任务中环境更改守卫、高级控件禁用与线程销毁安全。"""
+
+    @staticmethod
+    def _wait_idle(qapp, dialog, timeout_s=8.0):
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_s
+        while _time.monotonic() < deadline:
+            qapp.processEvents()
+            if not dialog._busy:
+                return True
+            _time.sleep(0.01)
+        return not dialog._busy
+
+    @staticmethod
+    def _wait_thread_deleted(qapp, ref, timeout_s=5.0):
+        """轮询事件循环直到 deleteLater 落地（sip 包装失效即 C++ 已销毁）。"""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_s
+        while _time.monotonic() < deadline:
+            qapp.processEvents()
+            try:
+                ref.objectName()
+            except RuntimeError:
+                return True
+            _time.sleep(0.01)
+        return False
+
+    @staticmethod
+    def _start_blocking_task(qapp, dialog, started, release):
+        import threading as _threading
+
+        def _task(progress_cb, cancel_check):
+            started.set()
+            release.wait(10)
+            return None
+
+        dialog._run_task(_task, lambda r: None, "busy")
+        holder = {"thread": dialog._thread, "worker": dialog._worker}
+        assert holder["thread"] is not None
+        return holder
+
+    def test_change_runtime_blocked_while_busy(self, qapp, tmp_path, monkeypatch):
+        """H11：任务运行中禁止更换对齐运行环境（不弹文件对话框）。"""
+        import strange_uta_game.frontend.editor.ai_timing_dialog as dlg_mod
+
+        snap = _ready_snapshot()
+        dialog, _ = _make_dialog(qapp, tmp_path, snap, [])
+        TestPathChangeAppliesImmediately._wait_initial_refresh(qapp, dialog)
+        dialog._busy = True
+        picked = []
+        monkeypatch.setattr(
+            dlg_mod.QFileDialog,
+            "getOpenFileName",
+            lambda *a, **k: picked.append(a) or ("", ""),
+        )
+        dialog._on_change_runtime()
+        assert picked == [], "任务中不得弹出解释器选择对话框"
+        assert dialog._settings.runtime_python == ""
+
+    def test_advanced_widgets_disabled_during_task(self, qapp, tmp_path):
+        """H11：任务进行中高级选项控件（模型/设备/镜像）全部禁用。"""
+        import threading as _threading
+
+        snap = _ready_snapshot()
+        dialog, _ = _make_dialog(qapp, tmp_path, snap, [])
+        TestPathChangeAppliesImmediately._wait_initial_refresh(qapp, dialog)
+
+        started = _threading.Event()
+        release = _threading.Event()
+        self._start_blocking_task(qapp, dialog, started, release)
+        assert started.wait(5)
+
+        for w in (dialog.combo_model, dialog.combo_device, dialog.combo_mirror,
+                  dialog.edit_mirror):
+            assert not w.isEnabled(), "任务中高级控件应禁用"
+        assert not dialog.btn_run.isEnabled()
+        assert dialog.btn_cancel.isEnabled()
+
+        release.set()
+        assert self._wait_idle(qapp, dialog)
+        for w in (dialog.combo_model, dialog.combo_device, dialog.combo_mirror,
+                  dialog.edit_mirror):
+            assert w.isEnabled(), "任务结束后高级控件应恢复"
+
+    def test_thread_objects_deleted_after_task(self, qapp, tmp_path):
+        """H14：任务结束线程退出后，QThread/worker 经 deleteLater 销毁，
+        不再随长会话累积。"""
+        snap = _ready_snapshot()
+        dialog, _ = _make_dialog(qapp, tmp_path, snap, [])
+        TestPathChangeAppliesImmediately._wait_initial_refresh(qapp, dialog)
+
+        dialog._run_task(lambda p, c: "ok", lambda r: None, "busy")
+        worker_ref = dialog._worker
+        thread_ref = dialog._thread
+        assert worker_ref is not None and thread_ref is not None
+
+        assert self._wait_idle(qapp, dialog)
+        # 线程退出 → deleteLater 落地后 sip 包装失效（C++ 对象已销毁）
+        assert self._wait_thread_deleted(qapp, thread_ref)
+        assert self._wait_thread_deleted(qapp, worker_ref)
+
+    def test_close_while_busy_detaches_thread_on_wait_timeout(
+        self, qapp, tmp_path, monkeypatch
+    ):
+        """G2：关窗时线程未在宽限内退出 → 摘掉父子关系保持引用延迟
+        销毁，而不是销毁运行中的 QThread（对话框析构即崩溃）。"""
+        import strange_uta_game.frontend.editor.ai_timing_dialog as dlg_mod
+
+        snap = _ready_snapshot()
+        dialog, _ = _make_dialog(qapp, tmp_path, snap, [])
+        TestPathChangeAppliesImmediately._wait_initial_refresh(qapp, dialog)
+
+        started = _start_evt = None
+        import threading as _threading
+
+        started = _threading.Event()
+        release = _threading.Event()
+        holder = self._start_blocking_task(qapp, dialog, started, release)
+        thread_ref = holder["thread"]
+        worker_ref = holder["worker"]
+        assert started.wait(5)
+
+        # 关窗确认弹窗选「取消并关闭」
+        monkeypatch.setattr(dlg_mod, "message_question", lambda *a, **k: True)
+        # 模拟 wait(5000) 超时（CUDA 释放等场景线程退不出宽限）
+        original_wait = thread_ref.wait
+        thread_ref.wait = lambda *a, **k: False
+
+        dialog.close()
+
+        # 保持引用且脱离对话框父子：线程销毁竞态消除
+        assert dialog._thread is not None
+        assert thread_ref.parent() is None
+
+        # 收尾：恢复真实 wait，任务自然结束，线程退出并经 deleteLater 回收
+        thread_ref.wait = original_wait
+        release.set()
+        assert original_wait(10000)
+        assert self._wait_idle(qapp, dialog)
+        assert self._wait_thread_deleted(qapp, thread_ref)
+        assert self._wait_thread_deleted(qapp, worker_ref)
+
+    def test_close_while_busy_waits_thread_normally(self, qapp, tmp_path, monkeypatch):
+        """G2 常规路径：宽限内退出 → 引用照常清理，无残留线程。"""
+        import strange_uta_game.frontend.editor.ai_timing_dialog as dlg_mod
+
+        snap = _ready_snapshot()
+        dialog, _ = _make_dialog(qapp, tmp_path, snap, [])
+        TestPathChangeAppliesImmediately._wait_initial_refresh(qapp, dialog)
+
+        import threading as _threading
+
+        started = _threading.Event()
+        release = _threading.Event()
+        self._start_blocking_task(qapp, dialog, started, release)
+        assert started.wait(5)
+
+        monkeypatch.setattr(dlg_mod, "message_question", lambda *a, **k: True)
+        dialog.close()
+        release.set()
+        assert self._wait_idle(qapp, dialog)
+        assert dialog._thread is None

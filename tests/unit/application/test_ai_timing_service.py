@@ -23,6 +23,7 @@ from strange_uta_game.backend.application.ai_timing.resolver import (
 )
 from strange_uta_game.backend.application.ai_timing.runtime import AiRuntimeManager
 from strange_uta_game.backend.application.ai_timing.service import (
+    WORKER_RUN_TIMEOUT_S,
     AiTimingError,
     AiTimingService,
 )
@@ -71,9 +72,11 @@ class _FakeWorker:
         self.fail = fail
         self.spans_override = spans_override
         self.calls = []
+        self.last_timeout_s = "<unset>"
 
     def run(self, request, audio_path, model_spec, on_progress=None, timeout_s=None):
         self.calls.append((request, audio_path, model_spec))
+        self.last_timeout_s = timeout_s
         if on_progress:
             on_progress("load", 50, "加载模型")
         if self.fail:
@@ -510,3 +513,62 @@ class TestWorkerLifecycleClose:
         with pytest.raises(Exception, match="AI 打轴执行失败"):
             service.execute(_project(), str(audio), vocal_choice=None)
         assert closed == [1]
+
+
+class TestCancelWiringAndTimeout:
+    """G1：取消必须能到达 worker 客户端（协作取消 + 宽限击杀），
+    worker.run 必须带硬超时——此前取消只在阶段边界轮询、worker 卡死
+    时宿主永远挂起。"""
+
+    def test_worker_run_receives_hard_timeout(self, tmp_path):
+        worker = _FakeWorker()
+        service, audio = _make_service(tmp_path, worker=worker)
+        service.execute(_project(), str(audio))
+        assert worker.last_timeout_s == WORKER_RUN_TIMEOUT_S
+
+    def test_cancel_reaches_worker_client(self, tmp_path):
+        import threading as _threading
+
+        from strange_uta_game.backend.application.ai_timing.alignment import (
+            AlignmentResult as _AR,
+            EmissionSpan as _ES,
+        )
+
+        class _BlockingWorker:
+            """模拟长推理：run() 阻塞直到 cancel() 到达。"""
+
+            def __init__(self):
+                self.cancel_called = _threading.Event()
+                self.cancelled_seen = False
+
+            def run(self, request, audio_path, model_spec, on_progress=None, timeout_s=None):
+                # 阶段边界轮询 cancel() 永远是 False（取消不经宿主轮询，
+                # 只能通过 client.cancel() 协作送达）
+                while not self.cancel_called.wait(0.05):
+                    pass
+                self.cancelled_seen = True
+                raise RuntimeError("已取消 AI 打轴")
+
+            def cancel(self):
+                self.cancel_called.set()
+
+            def close(self):
+                pass
+
+        worker = _BlockingWorker()
+        service, audio = _make_service(tmp_path, worker=worker)
+        flipped = _threading.Event()
+
+        def _cancelled():
+            return flipped.is_set()
+
+        timer = _threading.Timer(0.3, flipped.set)
+        timer.start()
+        try:
+            with pytest.raises(AiTimingError, match="取消"):
+                service.execute(_project(), str(audio), is_cancelled=_cancelled)
+        finally:
+            timer.cancel()
+        # 取消经 service 的取消守望线程送达 client.cancel()
+        assert worker.cancel_called.is_set()
+        assert worker.cancelled_seen

@@ -15,6 +15,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Thread
 from typing import Callable, List, Optional
 
 from strange_uta_game.backend.application.ai_timing.alignment import (
@@ -85,6 +86,11 @@ class WorkerLike:
         on_progress=None,
         timeout_s=None,
     ) -> AlignmentResult: ...  # pragma: no cover
+
+
+WORKER_RUN_TIMEOUT_S = 60 * 60
+"""对齐 worker 单次执行硬超时（默认 60 分钟）：CUDA 死锁等永久挂起时由
+client 的 watchdog 击杀进程并转换成中文超时错误，宿主不再无限等待。"""
 
 
 @dataclass
@@ -567,12 +573,33 @@ class AiTimingService:
             mapped = 20 + int(percent * 0.75)
             progress("align", min(95, mapped), message)
 
+        # 取消接线：run() 阻塞在读取循环里，取消标志只在阶段边界被轮询
+        # 永远到不了 worker——守望线程置位后立刻调 client 的协作取消
+        # （发送 cancel 消息 + 宽限期后击杀），推理才能被真正打断
+        cancel_done = Event()
+
+        def _cancel_watcher() -> None:
+            while not cancel_done.wait(0.5):
+                if cancel():
+                    killer = getattr(worker, "cancel", None)
+                    if callable(killer):
+                        try:
+                            killer()
+                        except Exception:
+                            pass
+                    return
+
+        cancel_watcher = Thread(
+            target=_cancel_watcher, name="ai-timing-cancel-watcher", daemon=True
+        )
+        cancel_watcher.start()
         try:
             result = worker.run(
                 request,
                 audio_path=str(vocal_path),
                 model_spec=model_spec,
                 on_progress=_map_worker_progress,
+                timeout_s=WORKER_RUN_TIMEOUT_S,
             )
         except Exception as exc:  # worker 层已转换中文错误
             if "取消" in str(exc):
@@ -581,6 +608,8 @@ class AiTimingService:
             log(f"worker 执行失败：{exc}")
             raise AiTimingError(f"AI 打轴执行失败：{exc}") from exc
         finally:
+            cancel_done.set()
+            cancel_watcher.join(timeout=3)
             # 生命周期卫生：无论成败都回收 worker 进程/管道/临时文件，
             # 模型内存随一次性子进程退出由系统释放
             closer = getattr(worker, "close", None)

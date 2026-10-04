@@ -277,7 +277,10 @@ def _read_local_manifest(plan: LaunchPlan) -> Optional[dict]:
 def _verify_zip_sha256(zip_path: str, url: str, proxies_dict: Optional[dict]) -> bool:
     """下载 ``{url}.sha256`` 并校验 zip 文件的 raw sha256。
 
-    校验失败或无法拉取 sha256 文件时返回 ``True``（降级为跳过校验），不阻断流程。
+    **fail-closed**：sha256 附属文件拉取失败 / 内容不可解析 / 哈希不匹配时
+    一律返回 ``False``，由调用方放弃该源。放行未经校验的字节等于把更新链
+    完整性交给出处不明的镜像；发布流程（scripts/release.py）保证每个 zip
+    都有同名 ``.sha256`` 资产，正常情况下不会因此误拒。
     """
     import requests
     import hashlib
@@ -294,16 +297,16 @@ def _verify_zip_sha256(zip_path: str, url: str, proxies_dict: Optional[dict]) ->
             allow_redirects=True,
         )
         if resp.status_code != 200:
-            log.warning("[self-update] 获取 sha256 文件失败 HTTP %s，跳过校验", resp.status_code)
-            return True
+            log.warning("[self-update] 获取 sha256 文件失败 HTTP %s，拒绝此源", resp.status_code)
+            return False
         m = re.search(r"\b([0-9a-fA-F]{64})\b", resp.text)
         if not m:
-            log.warning("[self-update] sha256 文件内容无法解析，跳过校验")
-            return True
+            log.warning("[self-update] sha256 文件内容无法解析，拒绝此源")
+            return False
         expected = m.group(1).lower()
     except Exception as e:
-        log.warning("[self-update] 获取 sha256 文件异常（跳过校验）: %s", e)
-        return True
+        log.warning("[self-update] 获取 sha256 文件异常（拒绝此源）: %s", e)
+        return False
 
     h = hashlib.sha256()
     try:
@@ -311,8 +314,8 @@ def _verify_zip_sha256(zip_path: str, url: str, proxies_dict: Optional[dict]) ->
             for chunk in iter(lambda: f.read(64 * 1024), b""):
                 h.update(chunk)
     except OSError as e:
-        log.warning("[self-update] 读取下载文件失败（跳过校验）: %s", e)
-        return True
+        log.warning("[self-update] 读取下载文件失败（拒绝此源）: %s", e)
+        return False
 
     actual = h.hexdigest().lower()
     if actual != expected:
@@ -320,6 +323,48 @@ def _verify_zip_sha256(zip_path: str, url: str, proxies_dict: Optional[dict]) ->
         return False
     log.info("[self-update] app.zip sha256 校验通过")
     return True
+
+
+def fetch_asset_sha256(
+    asset_name: str,
+    download_urls: List[Tuple[str, str]],
+    proxy_url: str = "",
+) -> str:
+    """按源顺序拉取与 ``asset_name`` 同目录的 ``.sha256`` 附属文件。
+
+    发布流程为每个 zip 上传同名 ``.sha256``（coreutils ``sha256sum`` 兼容），
+    与 :func:`_fetch_remote_manifest` 同样的 URL 推导规则。返回 64 位十六进制
+    摘要；全部源失败返回 ``""`` —— 调用方把空串透传给 Updater（``--sha256``），
+    Updater 侧会再尝试一次并在仍拿不到时拒绝安装（fail-closed）。
+    """
+    import requests
+    import re
+
+    proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    for _source_id, url in download_urls:
+        prefix = url.rsplit("/", 1)[0]
+        sha_url = f"{prefix}/{asset_name}.sha256"
+        log.info("[self-update] 预取主包 sha256: %s", sha_url)
+        try:
+            resp = requests.get(
+                sha_url,
+                headers={"User-Agent": "StrangeUtaGame-MainApp/self-update"},
+                proxies=proxies_dict,
+                timeout=(5, 15),
+                allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                continue
+            m = re.search(r"\b([0-9a-fA-F]{64})\b", resp.text)
+            if m:
+                digest = m.group(1).lower()
+                log.info("[self-update] 预取到主包 sha256: %s", digest)
+                return digest
+        except Exception as e:
+            log.debug("[self-update] 预取 sha256 失败（%s）: %s", _source_id, e)
+            continue
+    log.warning("[self-update] 所有源均未能预取主包 sha256，交由 Updater 再次尝试")
+    return ""
 
 
 def _update_updater_from_remote(

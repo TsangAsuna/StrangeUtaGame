@@ -127,12 +127,22 @@ def test_fallback_never_overwrites_explicit_binding():
     assert short.get("BACKSPACE") == "delete_timestamp"
 
 
-def test_flat_legacy_schema_still_honored():
-    """旧扁平 shortcuts.* 显式键位仍被读取（schema 兼容行为不变）。"""
-    data = {"shortcuts": {"remove_checkpoint": "3:short"}}
-    short, _, actions, migrated = _build(_DictSettings(data), "edit_mode")
-    assert short.get("3") == "remove_checkpoint"
-    assert actions["remove_checkpoint"] == "3:short"
+def test_flat_legacy_schema_timing_mode_only():
+    """旧扁平 shortcuts.* 只回填打轴模式；edit_mode 不再被注入打轴键位（A3）。
+
+    扁平 schema 是单模式（打轴）时代的产物：同时注入 edit_mode 会把
+    tag_now 等打轴专属键混入编辑模式键表，未播放时长按会在编辑模式下
+    连发结构编辑。
+    """
+    data = {"shortcuts": {"remove_checkpoint": "9:short"}}
+    short, _, actions, _ = _build(_DictSettings(data), "timing_mode")
+    assert short.get("9") == "remove_checkpoint"
+    assert actions["remove_checkpoint"] == "9:short"
+
+    # 编辑模式：扁平键位不再注入，回退到编辑模式默认键位（BACKSPACE）
+    short, _, _, _ = _build(_DictSettings(json.loads(json.dumps(data))), "edit_mode")
+    assert short.get("9") is None
+    assert short.get("BACKSPACE") == "remove_checkpoint"  # 编辑模式默认键位仍生效
 
 
 def test_old_format_trigger_gets_normalized_and_reported():

@@ -1097,3 +1097,153 @@ class TestNicokaraTagsRoundTrip:
         # 不应抛出
         _sync_nicokara_metadata_to_settings({})
         _sync_nicokara_metadata_to_settings(None)  # type: ignore[arg-type]
+
+
+class TestLRCRepeatLinesE2:
+    """E2：一行 ≥3 个时间标签不再被误判逐字格式，重复段按 LRC 惯例展开。"""
+
+    def test_repeat_line_expands_to_multiple_lines(self):
+        parser = LRCParser()
+        result = parser.parse("[00:10.00][00:20.00][00:30.00]春よ来い")
+
+        assert len(result) == 3
+        assert [p.timetags for p in result] == [
+            [(0, 10000)], [(0, 20000)], [(0, 30000)],
+        ]
+        assert all(p.text == "春よ来い" for p in result)
+
+    def test_two_adjacent_tags_expand_too(self):
+        parser = LRCParser()
+        result = parser.parse("[00:10.00][00:20.00]ラララ")
+
+        assert len(result) == 2
+        assert [p.timetags for p in result] == [[(0, 10000)], [(0, 20000)]]
+
+    def test_word_by_word_still_detected_by_gap_length(self):
+        """标签间都是短文本 → 仍按逐字格式解析。"""
+        parser = LRCParser()
+        result = parser.parse("[00:00.000]春[00:01.086]日[00:01.629]影[00:02.500]")
+
+        assert len(result) == 1
+        assert result[0].text == "春日影"
+        assert result[0].timetags == [(0, 0), (1, 1086), (2, 1629)]
+        assert result[0].line_end_ts == 2500
+
+    def test_long_gap_is_not_word_by_word(self):
+        """任一标签间隙超过 2 字 → 不按逐字格式（旧行为会拆坏文本）。"""
+        parser = LRCParser()
+        result = parser.parse("[00:10.00][00:20.00][00:30.00]春よ来い遠き日々よ")
+
+        # 不误判逐字：文本不出现 10ms 伪增量时间戳
+        assert len(result) == 3
+        assert all(p.timetags == [(0, ts)] for p, ts in zip(result, [10000, 20000, 30000]))
+
+
+class TestLRCOffsetE13:
+    """E13：[offset:±ms] 元数据整体平移时间轴。"""
+
+    def test_negative_offset_shifts_earlier(self):
+        parser = LRCParser()
+        result = parser.parse("[offset:-500]\n[00:06.540]一闪一闪亮晶晶[00:09.300]")
+
+        assert result[0].timetags == [(0, 6040)]
+        assert result[0].line_end_ts == 8800
+
+    def test_positive_offset_shifts_later(self):
+        parser = LRCParser()
+        result = parser.parse("[00:00.500]あ\n[offset:1000]")
+
+        assert result[0].timetags == [(0, 1500)]
+
+    def test_offset_clamped_at_zero(self):
+        parser = LRCParser()
+        result = parser.parse("[offset:-10000]\n[00:00.500]あ")
+
+        assert result[0].timetags == [(0, 0)]
+
+
+class TestTXTPunctuationRegexE10:
+    """E10：字符类里 \s 曾写成双反斜杠，单字符行 "s" 被当标点跳过。"""
+
+    def test_single_letter_line_kept(self):
+        parser = TXTParser()
+        result = parser.parse("s")
+        assert len(result) == 1
+        assert result[0].text == "s"
+
+    def test_single_letter_line_lrc_kept(self):
+        parser = LRCParser()
+        result = parser.parse("s")
+        assert len(result) == 1
+
+    def test_whitespace_only_line_still_skipped(self):
+        parser = TXTParser()
+        assert parser.parse("  \t ") == []
+
+
+class TestNicokaraRubyEntryCommaF11:
+    """F11（Nicokara 解析侧）：位置字段从右往左消费，
+    読み/位置自带逗号时不再被盲目 split(",") 拆坏。"""
+
+    def _parser(self):
+        from strange_uta_game.backend.infrastructure.parsers.lyric_parser import (
+            NicokaraParser,
+        )
+
+        return NicokaraParser()
+
+    def test_reading_with_trailing_timestamp_positions(self):
+        entry = self._parser()._parse_ruby_entry("奪,う[00:00:22]ば,[00:00:30],[00:00:40]")
+        assert entry is not None
+        assert entry.kanji == "奪"
+        assert entry.reading == "う[00:00:22]ば"
+        assert entry.positions == ["[00:00:30]", "[00:00:40]"]
+
+    def test_empty_position_fields(self):
+        entry = self._parser()._parse_ruby_entry("者,しゃ,,[00:27:01]")
+        assert entry is not None
+        assert entry.reading == "しゃ"
+        assert entry.positions == ["", "[00:27:01]"]
+
+    def test_no_positions(self):
+        entry = self._parser()._parse_ruby_entry("押,お")
+        assert entry is not None
+        assert entry.positions == []
+
+
+class TestParseFileEncodingFallbackE1:
+    """E1：parse_file 经公共 decode_lyric_bytes 走完整回退链。"""
+
+    def test_gbk_lrc_file(self, tmp_path):
+        # 简体中文歌词（GBK 字节序列不是合法 cp932）→ 回退链落到 gb18030
+        p = tmp_path / "song.lrc"
+        p.write_bytes("[00:01.00]从此我不能\n[00:02.00]听见你的温柔\n".encode("gbk"))
+
+        from strange_uta_game.backend.infrastructure.parsers.lyric_parser import (
+            LRCParser,
+        )
+
+        lines = LRCParser().parse_file(str(p))
+        assert [l.text for l in lines] == ["从此我不能", "听见你的温柔"]
+
+    def test_utf8_bom_lrc_file(self, tmp_path):
+        p = tmp_path / "song.lrc"
+        p.write_bytes("\ufeff[00:01.00]あ\n".encode("utf-8"))
+
+        from strange_uta_game.backend.infrastructure.parsers.lyric_parser import (
+            LRCParser,
+        )
+
+        lines = LRCParser().parse_file(str(p))
+        assert lines[0].text == "あ"
+
+    def test_undecodable_file_raises_parse_error(self, tmp_path):
+        p = tmp_path / "song.lrc"
+        p.write_bytes(b"\x81\x00\x81\x01")
+
+        from strange_uta_game.backend.infrastructure.parsers.lyric_parser import (
+            LRCParser,
+        )
+
+        with pytest.raises(ParseError):
+            LRCParser().parse_file(str(p))

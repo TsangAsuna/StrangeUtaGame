@@ -9,6 +9,9 @@ HH:MM:SS,mmm --> HH:MM:SS,mmm
 from .base import BaseExporter, ExportError
 from strange_uta_game.backend.domain import Project
 
+# 无后续时间信息时的最小显示时长（毫秒），也用作结束时间的下限钳制
+_MIN_DISPLAY_MS = 5000
+
 
 class SRTExporter(BaseExporter):
     """SRT 字幕格式导出器
@@ -51,15 +54,21 @@ class SRTExporter(BaseExporter):
             else:
                 start_ms = 0
 
-            # 结束时间：下一行的开始时间，或当前行 + 5 秒
+            # 结束时间：下一行的开始时间；末行用音频时长收尾（未知则退回
+            # 当前行 + 5 秒）。无论来源都钳制不早于「本行开始 + 最小显示
+            # 时长」——对唱重叠行下一行先于本行开始时直接沿用下一行 Start，
+            # 会导出 05:00 --> 04:00 的负时长非法 SRT。
             if i + 1 < len(sentences):
                 next_sentence = sentences[i + 1]
                 if next_sentence.has_timetags:
                     end_ms = (next_sentence.global_timing_start_ms or 0)
                 else:
-                    end_ms = start_ms + 5000
+                    end_ms = start_ms + _MIN_DISPLAY_MS
+            elif project.audio_duration_ms > start_ms:
+                end_ms = project.audio_duration_ms
             else:
-                end_ms = start_ms + 5000
+                end_ms = start_ms + _MIN_DISPLAY_MS
+            end_ms = max(end_ms, start_ms + _MIN_DISPLAY_MS)
 
             start_str = self._format_srt_timestamp(start_ms)
             end_str = self._format_srt_timestamp(end_ms)

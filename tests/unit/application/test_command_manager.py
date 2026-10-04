@@ -149,3 +149,92 @@ class TestCommandManager:
         manager.undo()
 
         assert callback_count == 2
+
+
+class FlakyCommand(Command):
+    """测试用可切换成功/失败的命令（undo/redo 行为独立可控）"""
+
+    def __init__(self, value: int):
+        self.value = value
+        self.undone = False
+        self.executed = False
+        self.fail_undo = False
+        self.fail_redo = False
+
+    def execute(self) -> None:
+        self.executed = True
+
+    def undo(self) -> None:
+        if self.fail_undo:
+            raise RuntimeError("undo 失败")
+        self.undone = True
+
+    def redo(self) -> None:
+        if self.fail_redo:
+            raise RuntimeError("redo 失败")
+        self.executed = True
+
+    @property
+    def description(self) -> str:
+        return f"Flaky {self.value}"
+
+
+class TestTransactionalUndoRedo:
+    """事务式迁移：undo/redo 执行失败时命令放回原栈（C3）。"""
+
+    def test_undo_failure_keeps_command_on_undo_stack(self):
+        manager = CommandManager()
+        cmd = FlakyCommand(1)
+        manager.execute(cmd)
+        cmd.fail_undo = True
+
+        with pytest.raises(RuntimeError, match="undo 失败"):
+            manager.undo()
+
+        # 命令未丢失：仍在撤销栈，可再次撤销
+        assert manager.can_undo()
+        assert manager.get_undo_description() == "Flaky 1"
+        assert not manager.can_redo()
+
+        cmd.fail_undo = False
+        assert manager.undo() == "Flaky 1"
+        assert manager.can_redo()
+
+    def test_redo_failure_keeps_command_on_redo_stack(self):
+        manager = CommandManager()
+        cmd = FlakyCommand(1)
+        manager.execute(cmd)
+        manager.undo()
+        cmd.fail_redo = True
+
+        with pytest.raises(RuntimeError, match="redo 失败"):
+            manager.redo()
+
+        # 重做条目未丢失（如 AI 打轴 redo 抛 ProjectDriftError 的场景）：
+        # 用户仍可撤销该条目回退状态，而不是永久丢失
+        assert manager.can_redo()
+        assert manager.get_redo_description() == "Flaky 1"
+        assert not manager.can_undo()
+
+        cmd.fail_redo = False
+        assert manager.redo() == "Flaky 1"
+        assert manager.can_undo()
+
+    def test_failure_notifies_state_changed(self):
+        callback_count = 0
+
+        def on_state_changed():
+            nonlocal callback_count
+            callback_count += 1
+
+        manager = CommandManager()
+        manager.set_on_state_changed(on_state_changed)
+        cmd = FlakyCommand(1)
+        manager.execute(cmd)
+        cmd.fail_undo = True
+
+        with pytest.raises(RuntimeError):
+            manager.undo()
+
+        # execute(1) + 失败回调(2) + 无第二次——失败路径也触发状态回调
+        assert callback_count == 2

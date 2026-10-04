@@ -330,6 +330,20 @@ class Sentence:
 
         if not self.characters:
             ch.is_line_end = True
+        else:
+            # 行尾标记迁移（一行只有一个 is_line_end，且位于行末）：
+            # 插入点越过原行尾字（idx 大于其位置）时，原行尾字不再位于行末，
+            # 标记迁移到新字符；插入字自带行尾标记但落在行尾字之前时，
+            # 清掉其标记，避免出现双行尾字。
+            end_idx = next(
+                (i for i, c in enumerate(self.characters) if c.is_line_end), -1
+            )
+            if end_idx >= 0:
+                if idx > end_idx:
+                    self.characters[end_idx].is_line_end = False
+                    ch.is_line_end = True
+                elif ch.is_line_end:
+                    ch.is_line_end = False
 
         self.characters.insert(idx, ch)
 

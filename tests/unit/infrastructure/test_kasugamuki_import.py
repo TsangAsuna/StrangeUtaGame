@@ -175,7 +175,10 @@ def test_project_import_service_accepts_krl_extension(monkeypatch):
         'config {"unused": {"nested": true}}\n'
         "{秒|[00:11:70]びょ[00:11:81]う>[00:11:70]byo[00:11:81]u}[00:12:00]"
     )
-    monkeypatch.setattr(Path, "read_text", lambda self, encoding: content)
+    # E1：导入服务改用 decode_lyric_bytes(read_bytes()) 走编码回退链
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda self: content.encode("utf-8")
+    )
 
     sentences, metadata = ProjectImportService.load_lyrics_and_meta_from_file(
         "lyrics.krl", SINGER_ID
@@ -218,7 +221,7 @@ def test_krl_config_and_unnumbered_ruby_via_parse_lyric_content():
 def test_linked_group_primary_subtitle_and_ruby_round_trip():
     source = (
         "前{明日|[00:01:00]あ[00:01:20]し[00:01:40]た>"
-        "[00:01:00]a[00:01:20]shi[00:01:40]ta}後[00:02:00]"
+        "[00:01:00]a[00:01:20]shi[00:01:40]ta}後[>00:02:00]"
     )
 
     sentences = sentences_from_kasugamuki(source, SINGER_ID)
@@ -235,7 +238,7 @@ def test_linked_group_primary_subtitle_and_ruby_round_trip():
     assert sentence.characters[2].ruby is None
     exported = sentences_to_kasugamuki(sentences)
     assert exported == (
-        "前{明日|[00:01:00]あ[00:01:20]し[00:01:40]た}後[00:02:00]"
+        "前{明日|[00:01:00]あ[00:01:20]し[00:01:40]た}後[>00:02:00]"
     )
 
     reparsed = sentences_from_kasugamuki(exported, SINGER_ID)[0]
@@ -253,7 +256,7 @@ def test_primary_round_trip_preserves_empty_and_space_only_subtitle_lines():
         "{空|[00:01:00]そら}\n"
         "\n"
         " \n"
-        "{白|[00:02:00]しろ}[00:02:50]"
+        "{白|[00:02:00]しろ}[>00:02:50]"
     )
 
     sentences = sentences_from_kasugamuki(source, SINGER_ID)
@@ -274,7 +277,7 @@ def test_discarded_romaji_only_group_does_not_invent_linked_word():
 
 
 def test_linked_group_line_key_up_is_restored_on_group_tail():
-    source = "{明日|[00:01:00]あ[00:01:20]し[00:01:40]た}[00:02:00]"
+    source = "{明日|[00:01:00]あ[00:01:20]し[00:01:40]た}[>00:02:00]"
 
     sentences = sentences_from_kasugamuki(source, SINGER_ID)
     characters = sentences[0].characters
@@ -387,3 +390,134 @@ def test_all_placeholder_untimed_ruby_degrades_to_plain_char():
     )
 
     assert sentences_to_kasugamuki([sentence]) == "寿"
+
+
+# ──────────────────────────────────────────────
+# F9 / F11 回归
+# ──────────────────────────────────────────────
+
+
+def _mk_sentence(chars):
+    from strange_uta_game.backend.domain.entities import Sentence
+
+    return Sentence(singer_id=SINGER_ID, characters=chars)
+
+
+def test_release_tag_before_untimed_char_keeps_symmetry_F9():
+    """F9：释放点用显式 [>ts] 标记，后随无 ts 正文不再凭空获得起始 ts。"""
+    from strange_uta_game.backend.domain.models import Character
+
+    a = Character(
+        char="あ", check_count=1, timestamps=[10000],
+        is_sentence_end=True, sentence_end_ts=12000, singer_id=SINGER_ID,
+    )
+    b = Character(char="い", check_count=0, singer_id=SINGER_ID)
+
+    exported = sentences_to_kasugamuki([_mk_sentence([a, b])])
+    assert exported == "[00:10:00]あ[>00:12:00]い"
+
+    reparsed = sentences_from_kasugamuki(exported, SINGER_ID)[0]
+    assert reparsed.characters[0].is_sentence_end
+    assert reparsed.characters[0].sentence_end_ts == 12000
+    assert reparsed.characters[1].timestamps == []
+    assert reparsed.characters[1].check_count == 0
+
+
+def test_linked_group_mid_release_not_lost_F9():
+    """F9：连词组中部的释放点按停顿点切子组导出，绑回对应字符。"""
+    from strange_uta_game.backend.domain.models import Character, Ruby, RubyPart
+
+    m1 = Character(
+        char="冒", check_count=1, timestamps=[5000],
+        ruby=Ruby(parts=[RubyPart(text="ぼ")]),
+        linked_to_next=True, is_sentence_end=True, sentence_end_ts=6000,
+        singer_id=SINGER_ID,
+    )
+    m2 = Character(char="険", check_count=0, singer_id=SINGER_ID)
+
+    exported = sentences_to_kasugamuki([_mk_sentence([m1, m2])])
+    assert exported == "{冒|[00:05:00]ぼ}[>00:06:00]険"
+
+    reparsed = sentences_from_kasugamuki(exported, SINGER_ID)[0]
+    assert reparsed.characters[0].sentence_end_ts == 6000
+    assert reparsed.characters[0].ruby.text == "ぼ"
+
+
+def test_tail_release_export_uses_release_marker_F9():
+    """F9：行尾释放同样输出 [>ts]（解析侧两者都识别）。"""
+    from strange_uta_game.backend.domain.models import Character
+
+    t = Character(
+        char="た", check_count=1, timestamps=[1000],
+        is_sentence_end=True, sentence_end_ts=2000, singer_id=SINGER_ID,
+    )
+    exported = sentences_to_kasugamuki([_mk_sentence([t])])
+    assert exported == "[00:01:00]た[>00:02:00]"
+
+    reparsed = sentences_from_kasugamuki(exported, SINGER_ID)[0]
+    assert reparsed.characters[0].sentence_end_ts == 2000
+
+
+def test_legacy_bare_release_tag_still_parsed_F9():
+    """F9：旧格式（裸 [ts] 在行尾/标签前）的释放语义保持向后兼容。"""
+    sentences = sentences_from_kasugamuki("{白|[00:02:00]しろ}[00:02:50]", SINGER_ID)
+    assert sentences[0].characters[0].is_sentence_end
+    assert sentences[0].characters[0].sentence_end_ts == 2500
+
+
+def test_reserved_chars_escaped_and_restored_F11():
+    """F11：KRL 结构字符 { } | > 在正文中以全角形近字替换并映射回来。"""
+    from strange_uta_game.backend.domain.models import Character
+
+    chars = [Character(char=ch, check_count=0, singer_id=SINGER_ID) for ch in "a{b|c}d>e"]
+    exported = sentences_to_kasugamuki([_mk_sentence(chars)])
+    for reserved in "{}|>":
+        assert reserved not in exported, reserved
+
+    reparsed = sentences_from_kasugamuki(exported, SINGER_ID)[0]
+    assert [c.char for c in reparsed.characters] == list("a{b|c}d>e")
+
+
+def test_reserved_char_in_ruby_layer_F11():
+    """F11：注音层文本中的结构字符同样转义，块边界不被破坏。"""
+    from strange_uta_game.backend.domain.models import Character, Ruby, RubyPart
+
+    ch = Character(
+        char="漢", check_count=1, timestamps=[1000],
+        ruby=Ruby(parts=[RubyPart(text="か>ん")]), singer_id=SINGER_ID,
+    )
+    exported = sentences_to_kasugamuki([_mk_sentence([ch])])
+    reparsed = sentences_from_kasugamuki(exported, SINGER_ID)[0]
+    assert reparsed.characters[0].ruby.text == "か>ん"
+
+
+def test_leading_role_tag_collision_escaped_F11():
+    """F11：歌词正文恰好以 【@ 开头时，@ 被替换为全角 ＠，
+    导入端不再把正文当角色标签剥掉。"""
+    from strange_uta_game.backend.domain.models import Character
+
+    chars = [
+        Character(char=ch, check_count=0, singer_id=SINGER_ID)
+        for ch in "【@サビ】だ"
+    ]
+    exported = sentences_to_kasugamuki([_mk_sentence(chars)])
+    assert exported.startswith("【＠")
+
+    reparsed = sentences_from_kasugamuki(exported, SINGER_ID)
+    assert reparsed[0].text == "【＠サビ】だ"
+
+
+def test_exported_singer_tag_not_escaped_F11():
+    """F11：导出器自插的演唱者标签（单 Character 持有多字符）不受
+    行首碰撞转义影响，导入端仍识别为角色标签。"""
+    from strange_uta_game.backend.domain.models import Character
+
+    tag = Character(char="【@miku】", check_count=0, singer_id=SINGER_ID)
+    body = Character(char="そ", check_count=1, timestamps=[1000], singer_id=SINGER_ID)
+    exported = sentences_to_kasugamuki([_mk_sentence([tag, body])])
+    assert exported.startswith("【@miku】")
+
+    reparsed = sentences_from_kasugamuki(
+        exported, SINGER_ID, name_to_singer_id={"miku": "singer-m"}
+    )
+    assert reparsed[0].text == "そ"

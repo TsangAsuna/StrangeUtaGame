@@ -37,10 +37,51 @@ _SOKUON = set("っッ")
 _LONG_VOWEL = set("ー")
 
 _KRL_TIMESTAMP_RE = re.compile(r"\[(\d{1,3}:\d{2}:\d{2,3})\]")
+# 释放（停顿点）时间标签 `[>MM:SS:cc]`（F9）：显式标记「这是前一个
+# 字符的释放点」，与起始 tag `[ts]` 区分——否则「释放 tag + 后随无 ts
+# 正文」会被误读成后字凭空获得起始时间戳。
+_KRL_RELEASE_TS_RE = re.compile(r"\[>(\d{1,3}:\d{2}:\d{2,3})\]")
 _KRL_CONFIG_START_RE = re.compile(r"\A\ufeff?\s*config\s*\{", re.IGNORECASE)
 # 行首角色标签：【@角色名】，`+` 连接表示合唱（如 【@miku+rin】）。
 # 标签不属于歌词正文；未标注的行沿用上一个角色。
 _KRL_ROLE_TAG_RE = re.compile(r"\A\s*【@([^【】\r\n]+)】")
+
+# 正文保留字符的最小转义（F11）：`{ } | >` 是 KRL 的结构字符
+# （块定界、层分隔），歌词原文含这些字符时导出后无法读回甚至崩解析。
+# 导出替换为全角形近字，导入映射回来。
+_KRL_ESCAPE = {"{": "｛", "}": "｝", "|": "｜", ">": "＞"}
+_KRL_UNESCAPE = {v: k for k, v in _KRL_ESCAPE.items()}
+
+
+def _escape_krl_text(text: str) -> str:
+    """导出前替换正文中的结构保留字符（F11）。"""
+    for src, dst in _KRL_ESCAPE.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def _unescape_krl_text(text: str) -> str:
+    """导入时把转义替换字符映射回原字符（F11）。"""
+    for src, dst in _KRL_UNESCAPE.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def _escape_leading_role_tag(line: str, chars: List[Character]) -> str:
+    """歌词正文恰好以 `【@` 开头时，把半角 @ 换成全角 ＠（F11）。
+
+    否则导入端会把 `【@...】` 当成角色元数据标签剥掉。导出器自插的
+    演唱者标签是单个 Character("【@名字】")，不满足「chars[0] 是单字
+    '【' 且 chars[1] 是 '@'」的条件，不受影响。
+    """
+    if (
+        len(chars) >= 2
+        and chars[0].char == "【"
+        and chars[1].char == "@"
+        and line.startswith("【@")
+    ):
+        return "【＠" + line[2:]
+    return line
 
 
 def strip_krl_config(content: str) -> str:
@@ -125,11 +166,15 @@ def _krl_block_to_characters(block: str, singer_id: str) -> List[Character]:
     display, separator, annotation = block.partition("|")
     if not separator or not display:
         raise ValueError(f"无效的 KRL 注音块: {{{block}}}")
+    # 结构字符转义还原（F11）：显示字与注音文本中的全角形近字映射回来
+    display = _unescape_krl_text(display)
     kana_layer, has_romaji, romaji_layer = annotation.partition(">")
     kana_parts, kana_timestamps = _parse_krl_layer(kana_layer)
     romaji_parts, romaji_timestamps = _parse_krl_layer(
         romaji_layer if has_romaji else ""
     )
+    kana_parts = [_unescape_krl_text(text) for text in kana_parts]
+    romaji_parts = [_unescape_krl_text(text) for text in romaji_parts]
 
     # The kana layer is the source pronunciation.  For self-ruby blocks such
     # as {しょ|>[00:19:77]sho}, only take timing from the romaji layer.
@@ -204,8 +249,19 @@ def sentence_from_kasugamuki(line: str, singer_id: str) -> Sentence:
             pos = next_pos
             continue
 
+        release_match = _KRL_RELEASE_TS_RE.match(line, pos)
+        if release_match:
+            # 显式释放标记 `[>ts]`（F9）：无条件绑给前一个字符，
+            # 不受后随内容影响——与导出侧 `_format_sentence_end` 对称。
+            if characters:
+                previous = characters[-1]
+                previous.is_sentence_end = True
+                previous.set_sentence_end_ts(parse_timestamp(release_match.group(1)))
+            pos = release_match.end()
+            continue
+
         character = Character(
-            char=line[pos],
+            char=_unescape_krl_text(line[pos]),
             check_count=1 if pending_timestamp is not None else 0,
             timestamps=[pending_timestamp] if pending_timestamp is not None else [],
             singer_id=singer_id,
@@ -288,12 +344,17 @@ def _get_sentence_end_ts(char: Character) -> Optional[int]:
 
 
 def _format_sentence_end(char: Character) -> str:
-    """如果字符是停顿点，返回停顿点时间标签字符串；否则返回空串。"""
+    """如果字符是停顿点，返回释放时间标签字符串；否则返回空串。
+
+    F9：释放点用显式 `[>ts]` 标记（区别于起始 tag `[ts]`），导入侧
+    无条件绑给前一个字符——否则「释放 tag + 后随无 ts 正文」会被
+    误读成后字凭空获得起始时间戳，往返语义错位。
+    """
     if not char.is_sentence_end:
         return ""
     se_ts = _get_sentence_end_ts(char)
     if se_ts is not None:
-        return f"[{format_timestamp(se_ts)}]"
+        return f"[>{format_timestamp(se_ts)}]"
     return ""
 
 
@@ -387,7 +448,9 @@ def _build_tagged_parts(
             continue
         if i < len(ts_list):
             result.append(f"[{format_timestamp(ts_list[i])}]")
-        result.append(text)
+        # 注音文本同样做结构字符转义（F11）：`|`/`>` 混进层文本会把
+        # 层切错位，`}` 会提前终结注音块
+        result.append(_escape_krl_text(text))
     return "".join(result)
 
 
@@ -410,7 +473,7 @@ def sentence_to_kasugamuki(sentence: Sentence) -> str:
         else:
             segments.append(_char_plain(char))
             i += 1
-    return "".join(segments)
+    return _escape_leading_role_tag("".join(segments), chars)
 
 
 def sentences_to_kasugamuki(sentences: List[Sentence]) -> str:
@@ -421,9 +484,9 @@ def _char_plain(char: Character) -> str:
     ts_list = _get_ts_list(char)
     base = ""
     if ts_list:
-        base = f"[{format_timestamp(ts_list[0])}]{char.char}"
+        base = f"[{format_timestamp(ts_list[0])}]{_escape_krl_text(char.char)}"
     else:
-        base = char.char
+        base = _escape_krl_text(char.char)
     return base + _format_sentence_end(char)
 
 
@@ -435,25 +498,53 @@ def _char_ruby_kana(char: Character) -> str:
     if not tagged:
         # 注音全是停顿占位且未打轴 → 退化为普通字符，不输出空注音块
         return _char_plain(char)
-    return f"{{{char.char}|{tagged}}}{_format_sentence_end(char)}"
+    return (
+        f"{{{_escape_krl_text(char.char)}|{tagged}}}"
+        f"{_format_sentence_end(char)}"
+    )
+
+
+def _split_group_at_releases(group: List[Character]) -> List[List[Character]]:
+    """把连词组按句中停顿点切成若干子组（F9）。
+
+    连词组中部的释放点此前被无条件丢弃（只输出组尾字符的停顿标记）。
+    在每个 is_sentence_end 字符处收尾切段，让释放标记正好落在该子组
+    之后、被导入侧绑回该字符。停顿点字符本就不该向后连读（与 inline
+    导入侧的连词规则一致），因此切点处断链是正确归一化。
+    """
+    subs: List[List[Character]] = []
+    start = 0
+    for idx, ch in enumerate(group):
+        if ch.is_sentence_end:
+            subs.append(group[start : idx + 1])
+            start = idx + 1
+    if start < len(group):
+        subs.append(group[start:])
+    return subs or [group]
 
 
 def _linked_group_kana(group: List[Character]) -> str:
-    base = "".join(ch.char for ch in group)
-    tagged: List[str] = []
-    for ch in group:
-        if ch.ruby:
-            tagged.append(
-                _build_tagged_parts(
-                    [part.text for part in ch.ruby.parts],
-                    _get_ts_list(ch),
-                    keep_empty_ts=True,
+    segments: List[str] = []
+    for sub in _split_group_at_releases(group):
+        base = _escape_krl_text("".join(ch.char for ch in sub))
+        tagged: List[str] = []
+        for ch in sub:
+            if ch.ruby:
+                tagged.append(
+                    _build_tagged_parts(
+                        [part.text for part in ch.ruby.parts],
+                        _get_ts_list(ch),
+                        keep_empty_ts=True,
+                    )
                 )
+        annotation = "".join(tagged)
+        if not annotation:
+            segments.append("".join(_char_plain(ch) for ch in sub))
+        else:
+            segments.append(
+                f"{{{base}|{annotation}}}{_format_sentence_end(sub[-1])}"
             )
-    annotation = "".join(tagged)
-    if not annotation:
-        return "".join(_char_plain(ch) for ch in group)
-    return f"{{{base}|{annotation}}}{_format_sentence_end(group[-1])}"
+    return "".join(segments)
 
 
 # ── 双注音格式（带罗马音） ──
@@ -530,7 +621,7 @@ def sentence_to_kasugamuki_romaji(
             # 非假名无注音 → 回退到单注音格式
             segments.append(_char_plain(char))
             i += 1
-    return "".join(segments)
+    return _escape_leading_role_tag("".join(segments), chars)
 
 
 def sentences_to_kasugamuki_romaji(
@@ -559,7 +650,10 @@ def _char_ruby_romaji(
     if not kana_tagged and not romaji_tagged:
         # 两层全是停顿占位且未打轴 → 退化为普通字符，不输出空注音块
         return _char_plain(char)
-    return f"{{{char.char}|{kana_tagged}>{romaji_tagged}}}{_format_sentence_end(char)}"
+    return (
+        f"{{{_escape_krl_text(char.char)}|{kana_tagged}>{romaji_tagged}}}"
+        f"{_format_sentence_end(char)}"
+    )
 
 
 def _char_self_ruby_romaji(char: Character, romaji_list: List[str]) -> str:
@@ -568,11 +662,14 @@ def _char_self_ruby_romaji(char: Character, romaji_list: List[str]) -> str:
     if not romaji_tagged:
         # 罗马音层全是停顿占位且未打轴 → 退化为普通字符，不输出空注音块
         return _char_plain(char)
-    return f"{{{char.char}|>{romaji_tagged}}}{_format_sentence_end(char)}"
+    return (
+        f"{{{_escape_krl_text(char.char)}|>{romaji_tagged}}}"
+        f"{_format_sentence_end(char)}"
+    )
 
 
 def _self_kana_group_romaji(group: List[Character], romaji_list: List[str]) -> str:
-    base = "".join(ch.char for ch in group)
+    base = _escape_krl_text("".join(ch.char for ch in group))
     romaji_tagged = _build_tagged_parts(romaji_list, _get_ts_list(group[0]))
     if not romaji_tagged:
         # 罗马音层全是停顿占位且未打轴 → 退化为普通字符组
@@ -585,30 +682,37 @@ def _linked_group_romaji(
     group_start: int,
     romaji_by_char: Dict[int, List[str]],
 ) -> str:
-    base = "".join(ch.char for ch in group)
-    kana_tagged: List[str] = []
-    romaji_tagged: List[str] = []
-    for local_idx, ch in enumerate(group):
-        ts_list = _get_ts_list(ch)
-        if ch.ruby:
-            kana_tagged.append(
-                _build_tagged_parts(
-                    [part.text for part in ch.ruby.parts],
-                    ts_list,
-                    keep_empty_ts=True,
+    segments: List[str] = []
+    # 连词组按句中停顿点切子组（F9：中部释放点不丢，绑回对应字符）
+    consumed = 0
+    for sub in _split_group_at_releases(group):
+        base = _escape_krl_text("".join(ch.char for ch in sub))
+        kana_tagged: List[str] = []
+        romaji_tagged: List[str] = []
+        for local_idx, ch in enumerate(sub):
+            ts_list = _get_ts_list(ch)
+            if ch.ruby:
+                kana_tagged.append(
+                    _build_tagged_parts(
+                        [part.text for part in ch.ruby.parts],
+                        ts_list,
+                        keep_empty_ts=True,
+                    )
                 )
+            romaji = romaji_by_char.get(group_start + consumed + local_idx, [])
+            if romaji:
+                romaji_tagged.append(_build_tagged_parts(romaji, ts_list))
+        consumed += len(sub)
+        kana_annotation = "".join(kana_tagged)
+        romaji_annotation = "".join(romaji_tagged)
+        if not kana_annotation and not romaji_annotation:
+            segments.append("".join(_char_plain(ch) for ch in sub))
+        else:
+            segments.append(
+                f"{{{base}|{kana_annotation}>{romaji_annotation}}}"
+                f"{_format_sentence_end(sub[-1])}"
             )
-        romaji = romaji_by_char.get(group_start + local_idx, [])
-        if romaji:
-            romaji_tagged.append(_build_tagged_parts(romaji, ts_list))
-    kana_annotation = "".join(kana_tagged)
-    romaji_annotation = "".join(romaji_tagged)
-    if not kana_annotation and not romaji_annotation:
-        return "".join(_char_plain(ch) for ch in group)
-    return (
-        f"{{{base}|{kana_annotation}>{romaji_annotation}}}"
-        f"{_format_sentence_end(group[-1])}"
-    )
+    return "".join(segments)
 
 
 def _linked_group_common(

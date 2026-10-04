@@ -141,6 +141,10 @@ class ExportInterface(QWidget):
         self._embedded = bool(embedded)
         self._project: Optional[Project] = None
         self._export_service = ExportService()
+        # 后台导出任务状态：导出移出 UI 线程执行，期间「导出」按钮转为取消入口
+        self._exporting = False
+        self._export_worker = None
+        self._export_thread = None
         # 输出目录是否由用户通过「浏览」主动选定。一经选定即保留，自动预填不再
         # 覆盖它（切换音频、改设置均不影响），直到用户再次「浏览」更换、或切换项目。
         # 放在 __init__ 而非 _init_ui，避免切语言重建时被清零。
@@ -1130,6 +1134,11 @@ class ExportInterface(QWidget):
         self.export_to_next_requested.emit()
 
     def _on_export(self):
+        if self._exporting:
+            # 导出进行中，「导出」按钮已转为取消入口
+            self._on_export_cancel_requested()
+            return
+
         if not self._project:
             InfoBar.warning(
                 title=self.tr("无项目"),
@@ -1218,13 +1227,16 @@ class ExportInterface(QWidget):
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             action = dialog.get_action()
-            if action == "char":
-                self._export_service.apply_ruby_parts_split(self._project, "char")
-                if self._store:
-                    self._store.mark_dirty()
-                    self._store.notify("rubies")
-            elif action == "mora":
-                self._export_service.apply_ruby_parts_split(self._project, "mora")
+            if action in ("char", "mora"):
+                # 均分会改写字符的 ruby.parts：先快照再应用，登记为可撤销命令
+                before_sentences = deepcopy(self._project.sentences)
+                self._export_service.apply_ruby_parts_split(self._project, action)
+                self._push_sentences_undo(
+                    before_sentences,
+                    self.tr("注音按{mode}均分").format(
+                        mode=self.tr("字符") if action == "char" else "mora"
+                    ),
+                )
                 if self._store:
                     self._store.mark_dirty()
                     self._store.notify("rubies")
@@ -1276,6 +1288,26 @@ class ExportInterface(QWidget):
                 filename = base_name + (f"_{gname}" if multi else "") + ext
                 export_jobs.append((filename, group, group is primary))
 
+            # 撞名校验：不同分组名 sanitize 后可能得到相同文件名（如 "A/B"
+            # 与 "A_B"），后导出的会静默覆盖先导出的 —— 撞名直接中止提示。
+            seen_names: list[str] = []
+            for filename, _group, _is_primary in export_jobs:
+                if filename in seen_names:
+                    InfoBar.error(
+                        title=self.tr("导出文件名冲突"),
+                        content=self.tr(
+                            "多个分组的导出文件名相同：{filename}\n"
+                            "请修改轴分组名称后重试"
+                        ).format(filename=filename),
+                        orient=Qt.Orientation.Horizontal,
+                        isClosable=True,
+                        position=InfoBarPosition.TOP,
+                        duration=8000,
+                        parent=self,
+                    )
+                    return
+                seen_names.append(filename)
+
             # 覆盖确认：合并为一次弹出——先收集全部已存在的目标文件再
             # 统一询问，取消则整体中止（逐一弹窗会在多组时连弹多次）。
             existing_files = [
@@ -1299,110 +1331,215 @@ class ExportInterface(QWidget):
                     no_text=self.tr("取消"),
                 ):
                     return
+        else:
+            export_jobs = [(base_name + ext, None, False)]
+            # 检查文件是否已存在
+            filepath = str(Path(output_dir) / (base_name + ext))
+            if Path(filepath).exists():
+                if not message_question(
+                    self,
+                    self.tr("文件已存在"),
+                    self.tr("文件已存在：\n{filename}").format(filename=base_name + ext)
+                    + "\n\n"
+                    + self.tr("是否覆盖该文件？"),
+                    yes_text=self.tr("覆盖"),
+                    no_text=self.tr("取消"),
+                ):
+                    return
 
-            exported_files: list[str] = []
-            failed_files: list[str] = []
-            for filename, group, is_primary in export_jobs:
-                filepath = str(Path(output_dir) / filename)
-                result = self._export_service.export(
-                    self._project,
-                    name,
-                    filepath,
-                    offset_ms=self._get_export_offset(),
-                    singer_ids=set(group.singer_ids) or None,
-                    insert_singer_tags=self._chk_insert_singer_tags.isChecked(),
-                    insert_singer_each_line=self._chk_insert_singer_each_line.isChecked(),
-                    singer_map=self._get_singer_map(),
-                    export_romaji=self._chk_export_romaji.isChecked(),
-                    romaji_options=romaji_options,
-                    software_compensation_ms=self._get_software_compensation(),
-                    tag_data=self._build_axis_tag_data(group, is_primary),
-                )
-                if result.success:
-                    exported_files.append(result.file_path or filepath)
-                else:
-                    failed_files.append(
-                        f"{filename}: {result.error_message or self.tr('未知错误')}"
-                    )
+        # 统一后台执行：UI 线程只做预检查与任务编排，逐任务写临时文件成功后
+        # os.replace 原子替换（H3）。
+        self._start_export_jobs(name, ext, export_jobs, romaji_options=romaji_options)
 
-            if exported_files:
+    def _push_sentences_undo(self, before_sentences, description: str) -> None:
+        """把注音均分等 sentences 结构变更登记为可撤销命令。
+
+        经主窗口打轴服务的共享 CommandManager 入撤销栈；找不到（独立宿主
+        等场景）时静默跳过，保持原直改行为。
+        """
+        if not self._project:
+            return
+        timing_service = getattr(self.window(), "_timing_service", None)
+        command_manager = (
+            getattr(timing_service, "command_manager", None) if timing_service else None
+        )
+        if command_manager is None:
+            return
+
+        from strange_uta_game.backend.application.commands import (
+            SentenceSnapshotCommand,
+        )
+
+        command = SentenceSnapshotCommand(
+            self._project,
+            before_sentences,
+            deepcopy(self._project.sentences),
+            description,
+        )
+        command_manager.execute(command)
+
+    def _start_export_jobs(
+        self,
+        format_name: str,
+        ext: str,
+        export_jobs: list,
+        romaji_options=None,
+    ) -> None:
+        """后台线程执行导出任务（H3：不阻塞 UI + 临时文件原子落盘 + 取消）。
+
+        export_jobs: [(filename, AxisGroup | None, is_primary)]。导出中再次
+        点击「导出」按钮转为取消请求（任务间生效）；逐任务先写同目录临时
+        文件，成功后 os.replace 覆盖目标，失败清理临时文件并汇总成功 N / 失败 M。
+        romaji_options: 上游罗马音转换选项，None 时由导出服务按默认行为处理。
+        """
+        from PyQt6.QtCore import QThread
+        from qfluentwidgets import StateToolTip
+
+        from strange_uta_game.frontend.workers import ExportTaskWorker
+
+        output_dir = self.line_output.text()
+        singer_map = self._get_singer_map()
+        jobs = []
+        for filename, group, is_primary in export_jobs:
+            jobs.append({
+                "file_path": str(Path(output_dir) / filename),
+                "format_name": format_name,
+                "ext": ext,
+                "kwargs": {
+                    "offset_ms": self._get_export_offset(),
+                    # group=None = 未配置分组，导出全部演唱者、不按组过滤标签
+                    "singer_ids": (
+                        set(group.singer_ids) or None
+                    ) if group is not None else None,
+                    "insert_singer_tags": self._chk_insert_singer_tags.isChecked(),
+                    "insert_singer_each_line": self._chk_insert_singer_each_line.isChecked(),
+                    "singer_map": singer_map,
+                    "export_romaji": self._chk_export_romaji.isChecked(),
+                    "romaji_options": romaji_options,
+                    "software_compensation_ms": self._get_software_compensation(),
+                    "tag_data": (
+                        self._build_axis_tag_data(group, is_primary)
+                        if group is not None
+                        else None
+                    ),
+                },
+            })
+
+        # 对项目副本执行导出，后台线程期间 UI 继续编辑不影响导出内容
+        project_copy = deepcopy(self._project)
+
+        green = _theme.status_complete.name()
+        state_tooltip = StateToolTip(self.tr("正在导出"), self.tr("准备中..."), self)
+        state_tooltip.setStyleSheet(f"""
+            StateToolTip {{
+                background-color: {green};
+                border: 1px solid {green};
+                border-radius: 8px;
+            }}
+            StateToolTip QLabel {{
+                color: white;
+            }}
+        """)
+        state_tooltip.move(state_tooltip.getSuitablePos())
+        state_tooltip.show()
+
+        worker = ExportTaskWorker(project_copy, self._export_service, jobs)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self._exporting = True
+        self._export_worker = worker
+        self._export_thread = thread
+        # 导出按钮转为取消入口
+        btn = getattr(self, "btn_export", None)
+        if btn is not None:
+            btn.setText(self.tr("取消导出"))
+
+        def _on_progress(phase: str, current: int, total: int) -> None:
+            state_tooltip.setContent(f"{phase} {current}/{total}")
+
+        def _cleanup() -> None:
+            self._export_worker = None
+            self._export_thread = None
+            self._exporting = False
+            btn = getattr(self, "btn_export", None)
+            if btn is not None:
+                btn.setText(self.tr("导出"))
+
+        def _on_finished(result: dict) -> None:
+            state_tooltip.setState(True)
+            _cleanup()
+            exported = result.get("exported", [])
+            failed = result.get("failed", [])
+            cancelled = result.get("cancelled", False)
+
+            if exported:
                 # 将本次使用的格式持久化为默认导出格式
                 settings = AppSettings()
-                settings.set("export.default_format", name)
+                settings.set("export.default_format", format_name)
                 settings.save()
                 InfoBar.success(
                     title=self.tr("导出成功"),
-                    content="\n".join(exported_files),
+                    content="\n".join(exported),
                     orient=Qt.Orientation.Horizontal,
                     isClosable=True,
                     position=InfoBarPosition.TOP,
                     duration=5000,
                     parent=self,
                 )
-            if failed_files:
+            if failed:
+                detail = "\n".join(
+                    f"{Path(path).name}: {msg or self.tr('未知错误')}"
+                    for path, msg in failed
+                )
+                title = self.tr("导出失败（成功 {n} / 失败 {m}）").format(
+                    n=len(exported), m=len(failed)
+                )
                 InfoBar.error(
-                    title=self.tr("导出失败"),
-                    content="\n".join(failed_files),
+                    title=title,
+                    content=detail,
                     orient=Qt.Orientation.Horizontal,
                     isClosable=True,
                     position=InfoBarPosition.TOP,
                     duration=8000,
                     parent=self,
                 )
-            return
+            elif cancelled and not exported:
+                InfoBar.info(
+                    title=self.tr("已取消"),
+                    content=self.tr("导出已取消，未写入任何文件"),
+                    orient=Qt.Orientation.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP,
+                    duration=3000,
+                    parent=self,
+                )
 
-        filename = base_name + ext
-        filepath = str(Path(output_dir) / filename)
-
-        # 检查文件是否已存在
-        if Path(filepath).exists():
-            if not message_question(
-                self,
-                self.tr("文件已存在"),
-                self.tr("文件已存在：\n{filename}").format(filename=filename)
-                + "\n\n"
-                + self.tr("是否覆盖该文件？"),
-                yes_text=self.tr("覆盖"),
-                no_text=self.tr("取消"),
-            ):
-                return
-
-        # 未配置字幕分组 = 导出全部演唱者（分组过滤在 axis_groups 分支处理）
-        result = self._export_service.export(
-            self._project,
-            name,
-            filepath,
-            offset_ms=self._get_export_offset(),
-            singer_ids=None,
-            insert_singer_tags=self._chk_insert_singer_tags.isChecked(),
-            insert_singer_each_line=self._chk_insert_singer_each_line.isChecked(),
-            singer_map=self._get_singer_map(),
-            export_romaji=self._chk_export_romaji.isChecked(),
-            romaji_options=romaji_options,
-            software_compensation_ms=self._get_software_compensation(),
-        )
-        if result.success:
-            # 将本次使用的格式持久化为默认导出格式
-            settings = AppSettings()
-            settings.set("export.default_format", name)
-            settings.save()
-
-            InfoBar.success(
-                title=self.tr("导出成功"),
-                content=result.file_path,
-                orient=Qt.Orientation.Horizontal,
-                isClosable=True,
-                position=InfoBarPosition.TOP,
-                duration=5000,
-                parent=self,
-            )
-        else:
+        def _on_error(err: str) -> None:
+            state_tooltip.setState(True)
+            _cleanup()
             InfoBar.error(
                 title=self.tr("导出失败"),
-                content=result.error_message or self.tr("未知错误"),
+                content=err,
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP,
-                duration=5000,
+                duration=8000,
                 parent=self,
             )
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(_on_progress)
+        worker.finished.connect(_on_finished)
+        worker.error.connect(_on_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        thread.start()
+
+    def _on_export_cancel_requested(self) -> None:
+        """请求取消当前导出（在任务边界生效，正在写盘的当前任务会完成）。"""
+        worker = getattr(self, "_export_worker", None)
+        if worker is not None:
+            worker.request_cancel()

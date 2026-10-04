@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 
 from strange_uta_game.backend.domain import Sentence, Character, Ruby, RubyPart
+from strange_uta_game.backend.infrastructure.parsers.encoding import decode_lyric_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -144,15 +145,15 @@ class LyricParser(ABC):
             raise ParseError(f"文件不存在: {file_path}")
 
         try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            # 尝试 Shift-JIS 编码
-            try:
-                content = path.read_text(encoding="shift_jis")
-            except Exception as e:
-                raise ParseError(f"无法解码文件: {e}")
+            raw = path.read_bytes()
         except Exception as e:
             raise ParseError(f"读取文件失败: {e}")
+
+        try:
+            # 公共编码回退链：BOM → utf-8-sig → cp932 → gb18030 → big5（E1）
+            content, _encoding = decode_lyric_bytes(raw)
+        except UnicodeDecodeError as e:
+            raise ParseError(f"无法解码文件: {e}")
 
         return self.parse(content)
 
@@ -181,9 +182,10 @@ class TXTParser(LyricParser):
             if line_text.isdigit():
                 continue
 
-            # 跳过纯标点和特殊符号行
+            # 跳过纯标点和特殊符号行（注意 \s 是空白类；写成 \\s 会把
+            # 「反斜杠+s」当标点，单字符行 "s" 被误跳过 —— E10）
             if re.match(
-                r"^[\[\]【】（）(){}<>\"\u2018\u2019`~!@#$%^&*+=|\\:;,.?/\\s\-]+$",
+                r"^[\[\]【】（）(){}<>\"\u2018\u2019`~!@#$%^&*+=|\\:;,.?/\s\-]+$",
                 line_text,
             ):
                 continue
@@ -226,6 +228,14 @@ class LRCParser(LyricParser):
         """解析 LRC 格式"""
         # 去除 UTF-8 BOM（Python str.strip() 不会移除 \ufeff）
         content = content.lstrip("\ufeff")
+
+        # [offset:±ms] 全局偏移标签（E13）：LRC 元数据可整体平移时间轴。
+        # 取文件中最后一次出现的值；约定正值 = 时间戳整体后移
+        # （歌词延后显示），负值前移；平移后不产生负时间戳。
+        offset_ms = 0
+        for offset_match in re.finditer(r"\[offset:([+-]?\d+)\]", content, re.IGNORECASE):
+            offset_ms = int(offset_match.group(1))
+
         lines = []
 
         for line_text in content.split("\n"):
@@ -238,9 +248,9 @@ class LRCParser(LyricParser):
             if line_text.isdigit():
                 continue
 
-            # 跳过纯标点和特殊符号行
+            # 跳过纯标点和特殊符号行（同 E10：\s 是空白类，不能写成 \\s）
             if re.match(
-                r"^[\[\]【】（）(){}<>\"\u2018\u2019`~!@#$%^&*+=|\\:;,.?/\\s\-]+$",
+                r"^[\[\]【】（）(){}<>\"\u2018\u2019`~!@#$%^&*+=|\\:;,.?/\s\-]+$",
                 line_text,
             ):
                 continue
@@ -311,6 +321,20 @@ class LRCParser(LyricParser):
                 last_match = matches[-1]
                 lyric_text = _cjk_strip(line_text[last_match.end():])
 
+                # LRC 重复段惯例（E2）：行首连续多个时间标签后接正文
+                # （[t1][t2][t3]歌词）表示同一段歌词在多个时间点重复出现，
+                # 展开为多行；旧实现误把这类行当逐字格式，全部时间只挂到
+                # 最后一个标签上。
+                if lyric_text and self._has_only_adjacent_tags(line_text, matches):
+                    for match in matches:
+                        lines.append(
+                            ParsedLine(
+                                text=lyric_text,
+                                timetags=[(0, self._parse_timestamp(match))],
+                            )
+                        )
+                    continue
+
                 # 行尾空时间标签：最后一个标签后无文本（[start]歌词[end]），
                 # 该标签即行末释放点（与 SRT/ASS 的 End 同义）
                 line_end_ts: Optional[int] = None
@@ -342,15 +366,36 @@ class LRCParser(LyricParser):
                     )
                 )
 
+        # 应用 [offset:] 全局偏移（E13）
+        if offset_ms:
+            for parsed in lines:
+                parsed.timetags = [
+                    (ci, max(0, ts + offset_ms)) for ci, ts in parsed.timetags
+                ]
+                if parsed.line_end_ts is not None:
+                    parsed.line_end_ts = max(0, parsed.line_end_ts + offset_ms)
+
         return lines
+
+    @staticmethod
+    def _has_only_adjacent_tags(line_text: str, matches: List[re.Match]) -> bool:
+        """行首多个时间标签是否连续相邻（标签之间无正文）→ LRC 重复段写法。"""
+        for i in range(len(matches) - 1):
+            gap = line_text[matches[i].end(): matches[i + 1].start()]
+            if gap.strip():
+                return False
+        return True
 
     def _is_word_by_word_format(self, line_text: str, matches: List[re.Match]) -> bool:
         """判断是否是逐字格式
 
-        逐字格式特征：
-        1. 时间标签之间间隔很短（通常是1-3个字符）
-        2. 时间标签数量较多（超过2个）
-        3. 第一个时间标签在开头或紧跟很少字符
+        逐字格式特征（E2）：
+        1. 时间标签数量 >= 3；
+        2. 第一个时间标签在行首；
+        3. **按标签间文本长度判定**：每个标签之间的文本都很短
+           （逐字打轴每个标签通常只带 1 个字符，放宽到 2）。
+           整句长文本夹在少数标签之间的「重复段」写法
+           （[t1][t2][t3]歌词）不在此列——那种行交给重复段展开。
         """
         if len(matches) < 3:
             return False
@@ -363,15 +408,18 @@ class LRCParser(LyricParser):
             if len(prefix) > 0:
                 return False
 
-        # 检查时间标签密度
-        # 逐字格式通常每个字符都有一个时间标签
-        # 简单判断：如果时间标签数量 > 2 且文本中包含多个时间标签，认为是逐字格式
-        text_without_tags = self.TIME_TAG_PATTERN.sub("", line_text)
-        # 移除空白后的纯文本长度
-        clean_text = _cjk_strip(text_without_tags)
+        # 标签间文本长度：任一间隙超过 2 个字符 → 不是逐字格式
+        for i in range(len(matches) - 1):
+            gap = line_text[matches[i].end(): matches[i + 1].start()]
+            if len(_cjk_strip(gap)) > 2:
+                return False
 
-        # 如果时间标签数量接近或大于文本长度，认为是逐字格式
-        return len(matches) >= 3
+        # 末标签后的文本同样必须短（或为空 = 行尾释放标签）
+        trailing = line_text[matches[-1].end():]
+        if len(_cjk_strip(trailing)) > 2:
+            return False
+
+        return True
 
     def _parse_word_by_word(
         self, line_text: str, matches: List[re.Match]
@@ -804,14 +852,15 @@ class NicokaraParser:
             raise ParseError(f"文件不存在: {file_path}")
 
         try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                content = path.read_text(encoding="shift_jis")
-            except Exception as e:
-                raise ParseError(f"无法解码文件: {e}")
+            raw = path.read_bytes()
         except Exception as e:
             raise ParseError(f"读取文件失败: {e}")
+
+        try:
+            # 公共编码回退链：BOM → utf-8-sig → cp932 → gb18030 → big5（E1）
+            content, _encoding = decode_lyric_bytes(raw)
+        except UnicodeDecodeError as e:
+            raise ParseError(f"无法解码文件: {e}")
 
         return self.parse(content)
 
@@ -959,14 +1008,25 @@ class NicokaraParser:
         例:   押,お
               奪,う[00:00:22]ば
               者,しゃ,,[00:27:01]
+
+        位置字段从右往左消费（F11）：只有空串或完整时间戳的字段才算
+        位置，其余并回読み——避免正文/读音自带半角逗号时被盲目按
+        split(",") 拆坏。漢字与読み之间仍以第一个逗号为界。
         """
         parts = entry_text.split(",")
         if len(parts) < 2:
             return None
 
+        # 从右往左消费位置字段：空串或可解析为 [MM:SS:CC] 的时间戳
+        positions: List[str] = []
+        while len(parts) > 2:
+            tail = parts[-1]
+            if tail and _parse_nicokara_ts_str(tail) is None:
+                break
+            positions.insert(0, parts.pop())
+
         kanji = parts[0]
-        reading = parts[1]
-        positions = parts[2:] if len(parts) > 2 else []
+        reading = ",".join(parts[1:]) if len(parts) > 2 else parts[1]
 
         return NicokaraRubyEntry(
             kanji=kanji,
@@ -1629,12 +1689,8 @@ class LyricParserFactory:
         if not path.exists():
             return False
         try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                content = path.read_text(encoding="shift_jis")
-            except Exception:
-                return False
+            # 公共编码回退链（E1），GBK/Big5 文件同样能被检测
+            content, _encoding = decode_lyric_bytes(path.read_bytes())
         except Exception:
             return False
         return NicokaraParser.is_nicokara_format(content)

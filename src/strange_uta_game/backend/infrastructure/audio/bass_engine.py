@@ -283,6 +283,9 @@ class BassEngine(IAudioEngine):
         self._stream_lock = threading.RLock()
         self._recovery_thread: Optional[threading.Thread] = None
 
+        # 设备恢复完成回调（BASS_Free 重建会话后失效 keysound/metronome 句柄）
+        self._device_recovered_cb: Optional[Callable[[], None]] = None
+
         # UI-only monotonic guard, never used by timing keys.
         self._last_reported_ms: int = 0
 
@@ -806,8 +809,20 @@ class BassEngine(IAudioEngine):
         if not self._playback_path:
             return False
         if self._recovering:
-            if self._recovery_thread is not None:
-                self._recovery_thread.join(timeout=3.0)
+            thread = self._recovery_thread
+            if thread is not None:
+                # 必须先释放本线程持有的外层锁再 join：后台恢复线程要拿到
+                # _stream_lock 才能推进（_do_recover 全程持锁），而锁此刻正
+                # 被本线程持有（play() 进入时获取的那一层 RLock）。持锁 join
+                # 只能等满超时——表现为播放期间设备丢失点播放时 UI 卡 3 秒。
+                # _release_save/_acquire_restore 完整保存/恢复 RLock 递归
+                # 深度（threading.Condition 同款用法），比手工 release/
+                # acquire 配对更稳。
+                state = self._stream_lock._release_save()
+                try:
+                    thread.join(timeout=3.0)
+                finally:
+                    self._stream_lock._acquire_restore(state)
             return self._tempo_stream != 0
         self._recovering = True
         self._last_recovery_attempt = time.monotonic()
@@ -816,6 +831,15 @@ class BassEngine(IAudioEngine):
             return self._do_recover()
         finally:
             self._recovering = False
+
+    def set_device_recovered_callback(
+        self, callback: Optional[Callable[[], None]]
+    ) -> None:
+        """注册设备恢复回调（BASS_Free 重建会话后触发，见 IAudioEngine）。
+
+        回调在恢复线程上执行，UI 层不得在其中直接操作 Qt 对象。
+        """
+        self._device_recovered_cb = callback
 
     def _do_recover(self) -> bool:
         """Rebuild the device + streams, preserving position/speed/volume.
@@ -829,9 +853,11 @@ class BassEngine(IAudioEngine):
             should_resume = self._state == PlaybackState.PLAYING
             speed = self._speed
             volume = self._volume
+            freed = False
             try:
                 self._free_streams()
                 _bass.BASS_Free()
+                freed = True
                 self._initialized = False
                 if not self._ensure_initialized():
                     self._state = PlaybackState.PAUSED
@@ -854,6 +880,16 @@ class BassEngine(IAudioEngine):
                 print(f"[BassEngine] device recovery failed: {exc}")
                 self._state = PlaybackState.PAUSED
                 return False
+            finally:
+                if freed:
+                    # D10：BASS_Free 已使进程内所有 sample 句柄失效（按键音/
+                    # 节拍器）。无论恢复成败都要通知 UI 层失效并重载样本；
+                    # 回调在恢复线程上执行，UI 层须自行 marshal 回主线程。
+                    if self._device_recovered_cb is not None:
+                        try:
+                            self._device_recovered_cb()
+                        except Exception as exc:
+                            print(f"[BassEngine] device recovered callback error: {exc}")
 
     # ═══════════════════════════════════════════════════════════════
     # IAudioEngine — speed (real-time via BASS_FX)

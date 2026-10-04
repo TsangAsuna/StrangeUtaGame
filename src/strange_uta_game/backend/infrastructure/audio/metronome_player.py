@@ -147,19 +147,24 @@ import sounddevice as _sd
 import soundfile as _sf
 import numpy as _np
 
+from .keysound_player import SdSampleStreamPool
+
 
 class SoundDeviceMetronomePlayer:
     """基于 sounddevice 的节拍音播放器（mac 等无 BASS 平台使用）。
 
     与 :class:`MetronomePlayer` 同接口：``load`` 预读 WAV 为 numpy 数组，
-    ``play_*`` 调 ``sounddevice.play``。节拍音对延迟容忍度高，per-call
-    播放足够，不复刻主引擎的 ring buffer。
+    ``play_*`` 经轮换 OutputStream 池播放（连打节拍音可重叠，不再后次
+    掐前次）。节拍音对延迟容忍度高，per-call 播放足够，不复刻主引擎的
+    ring buffer。
     """
 
     def __init__(self) -> None:
         self._beat: tuple[_np.ndarray, int] | None = None  # (data, sample_rate)
         self._accent: tuple[_np.ndarray, int] | None = None
-        self._volume: float = 1.0  # 0.0 ~ 2.0
+        self._volume: float = 0.0  # 0.0 ~ 2.0
+        # 轮换流池：密集节奏点处节拍音可重叠播放
+        self._pool = SdSampleStreamPool(size=3)
 
     def load(self, beat_path: Path, accent_path: Path) -> None:
         """加载普通拍和重音；失败静默跳过。"""
@@ -181,7 +186,7 @@ class SoundDeviceMetronomePlayer:
             return
         data, sr = sample
         try:
-            _sd.play(data * self._volume, sr)
+            self._pool.play(data * self._volume, sr)
         except Exception:
             pass  # 设备忙/不可用时不打断主流程
 
@@ -207,6 +212,7 @@ class SoundDeviceMetronomePlayer:
     def free(self) -> None:
         self._beat = None
         self._accent = None
+        self._pool.close()
 
 
 def create_metronome_player():

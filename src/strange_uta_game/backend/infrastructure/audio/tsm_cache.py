@@ -132,7 +132,12 @@ def clear_cache() -> None:
 def clear_cache_for_song(song_name: str) -> None:
     """清空指定歌曲的所有缓存文件（包括源 MP3）"""
     cache_dir = _get_cache_dir()
-    for f in cache_dir.glob(f"{song_name}_*.mp3"):
+    # 歌名可能含 glob 元字符（[]*?），拼进 glob 模式会导致永不匹配；
+    # 改为遍历缓存目录后按前缀过滤。
+    prefix = f"{song_name}_"
+    for f in cache_dir.glob("*.mp3"):
+        if not f.name.startswith(prefix):
+            continue
         try:
             f.unlink()
         except Exception:
@@ -567,24 +572,40 @@ class TSMRenderCache:
         progress_cb: Optional[ProgressCallback] = None,
         done_cb: Optional[DoneCallback] = None,
         preempt: bool = False,
+        check_only: bool = False,
     ) -> Optional[np.ndarray]:
         """确保 ``speed`` 对应的 PCM 就绪。
 
         ``preempt=True``（UI 主动申请的当前速度）：打断正在渲染的其它速度任务、
         让出 worker 槽，使本次以最高优先级立即开跑；被打断的任务按原优先级
         重新入队，稍后继续。
+
+        ``check_only=True``（预热路径）：只做存在性检查——内存缓存命中或磁盘
+        缓存文件存在即视为就绪并返回 ``True``，未就绪则派发渲染任务并返回
+        ``None``。**绝不做整曲 MP3 解码**：预热一次会检查 10 个速度档，若每档
+        都把磁盘缓存整曲解码进内存（且大多被 LRU 挤掉），会在调用线程上产生
+        长阻塞和 GB 级无效内存占用。
         """
         if self._source_mp3_path is None:
             return None
         q = _quantize(speed)
         if abs(q - 1.0) < 1e-9:
-            return self._load_source_pcm()
+            return True if check_only else self._load_source_pcm()
 
-        # 检查磁盘缓存
-        cached = self.get(q)
-        if cached is not None:
-            print(f"[TSM缓存] 缓存命中，速度 {q}x，无需渲染")
-            return cached
+        if check_only:
+            # check_only：只查存在性，不解码。未就绪则跳过解码、直接落入
+            # 下方派发路径（预热本来就是要触发后台渲染）。
+            with self._mem_cache_lock:
+                if q in self._memory_cache:
+                    return True
+            if _get_cache_path(self._song_name, q).exists():
+                return True
+        else:
+            # 检查磁盘缓存（命中会整曲解码进内存——预热路径不走这里）
+            cached = self.get(q)
+            if cached is not None:
+                print(f"[TSM缓存] 缓存命中，速度 {q}x，无需渲染")
+                return cached
 
         # 检查是否已在活跃渲染中
         with self._active_lock:
@@ -885,6 +906,14 @@ class TSMRenderCache:
         不会占用渲染 worker 槽，也不会在 Worker 的 done_callback 里阻塞。
         """
         try:
+            # 入口复查：任务可能在全部块完成与 finalizer 开跑之间被取消
+            # （切歌 _cancel_all_and_wait / 抢占 _preempt_active / 版本推进）。
+            # 不复查的话会用「当时」的 _song_name 把旧歌 PCM 写成新歌的缓存
+            # 文件——之后调速就静默播放错歌音频。
+            if task.cancelled or self._render_version != task.version:
+                print(f"[TSM渲染] 速度 {task.speed}x 任务已取消/过期，丢弃合并结果")
+                return
+
             print(f"[TSM渲染] 速度 {task.speed}x 全部块完成，开始合并...")
             # 用 task.lock 读取回调，防止与 ensure() 的回调升级竞争。
             # 在 merge 前快照一次，后续复用快照值（merge 期间回调不可能再变）。
@@ -899,6 +928,11 @@ class TSMRenderCache:
                     pass
 
             final_pcm = self._merge_chunks(task)
+
+            # 写盘前二次复查：merge 耗时较长，期间可能发生切歌/抢占。
+            if task.cancelled or self._render_version != task.version:
+                print(f"[TSM渲染] 速度 {task.speed}x 合并后任务已取消/过期，丢弃结果")
+                return
 
             # 保存到磁盘
             cache_path = _get_cache_path(self._song_name, task.speed)

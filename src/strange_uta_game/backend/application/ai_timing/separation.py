@@ -464,6 +464,17 @@ import os, shutil
 src = stem_files[0]
 dst = os.path.join(out_dir, os.path.splitext(os.path.basename(inp))[0] + "_人声.wav")
 shutil.move(os.path.join(out_dir, src), dst)
+# 清掉本次分离产生的非人声轨（伴奏等）：output_dir 就是用户音乐目录，
+# 不删会在原曲旁留几十 MB 的孤儿文件（且每次分离都新增一份）
+for f in outputs:
+    if f == src:
+        continue
+    p = os.path.join(out_dir, f)
+    if os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 print("done:" + dst, flush=True)
 """
 

@@ -4,7 +4,8 @@
 命令操作的对象是新层次化领域模型：Sentence → Character → Ruby。
 """
 
-from typing import Optional, Dict, Any
+from copy import deepcopy
+from typing import Optional, Dict, Any, List, Tuple
 from strange_uta_game.backend.domain import (
     Project,
     Sentence,
@@ -12,6 +13,7 @@ from strange_uta_game.backend.domain import (
     Ruby,
 )
 from .base import Command
+from .sentence_snapshot import SentenceSnapshotCommand
 
 
 class AddTimeTagCommand(Command):
@@ -68,6 +70,65 @@ class AddTimeTagCommand(Command):
     @property
     def description(self) -> str:
         return f"添加时间标签 [{self.timestamp_ms}ms]"
+
+
+class SetTimestampCommand(Command):
+    """覆写指定 checkpoint 时间戳命令（微调用）。
+
+    记录 old/new 两个值，execute 覆写为 new，undo 恢复为 old。
+    与 AddTimeTagCommand 的区别：本命令只覆写已存在的时间戳槽位
+    （不改变 timestamps 长度），供 Alt+↑/↓ 等微调入口走 CommandManager
+    获得撤销能力。
+    """
+
+    def __init__(
+        self,
+        project: Project,
+        sentence_id: str,
+        char_idx: int,
+        checkpoint_idx: int,
+        old_ts: int,
+        new_ts: int,
+        is_sentence_end_cp: bool = False,
+    ):
+        self.project = project
+        self.sentence_id = sentence_id
+        self.char_idx = char_idx
+        self.checkpoint_idx = checkpoint_idx
+        self.old_ts = old_ts
+        self.new_ts = new_ts
+        self.is_sentence_end_cp = is_sentence_end_cp
+        # 光标追踪：撤销/重做后应恢复的全局 checkpoint 索引
+        self.undo_cp_idx: Optional[int] = None
+        self.redo_cp_idx: Optional[int] = None
+
+    def _write(self, ts: int) -> None:
+        sentence = self.project.get_sentence(self.sentence_id)
+        if not sentence:
+            raise ValueError(f"句子 {self.sentence_id} 不存在")
+        char = sentence.get_character(self.char_idx)
+        if not char:
+            raise ValueError(f"字符索引 {self.char_idx} 超出范围")
+
+        if self.is_sentence_end_cp:
+            # set_sentence_end_ts 内部已做 _update_offset_timestamps + push_to_ruby
+            char.set_sentence_end_ts(ts)
+        else:
+            if self.checkpoint_idx >= len(char.timestamps):
+                raise ValueError(f"checkpoint 索引 {self.checkpoint_idx} 超出范围")
+            char.timestamps[self.checkpoint_idx] = ts
+            char._update_offset_timestamps()
+            char.push_to_ruby()
+
+    def execute(self) -> None:
+        self._write(self.new_ts)
+
+    def undo(self) -> None:
+        self._write(self.old_ts)
+
+    @property
+    def description(self) -> str:
+        return f"微调时间戳 [{self.old_ts}ms → {self.new_ts}ms]"
 
 
 class RemoveTimeTagCommand(Command):
@@ -202,6 +263,8 @@ class UpdateCharacterCommand(Command):
         # 过滤非法属性
         self.updates = {k: v for k, v in kwargs.items() if k in self.ALLOWED_ATTRS}
         self._old_values: Dict[str, Any] = {}
+        # check_count 走权威 setter 时联动的 timestamps / ruby 原状态（undo 还原用）
+        self._old_check_count_state: Optional[Dict[str, Any]] = None
 
     def execute(self) -> None:
         sentence = self.project.get_sentence(self.sentence_id)
@@ -215,8 +278,20 @@ class UpdateCharacterCommand(Command):
         for key in self.updates:
             self._old_values[key] = getattr(char, key)
 
-        # 应用新值
+        # check_count 必须走权威 setter（直接 setattr 会绕过 timestamps 截断
+        # 与 ruby.parts 合并/重分段的不变式维护）
+        if "check_count" in self.updates:
+            self._old_check_count_state = {
+                "check_count": char.check_count,
+                "timestamps": list(char.timestamps),
+                "ruby": deepcopy(char.ruby),
+            }
+            char.set_check_count(self.updates["check_count"])
+
+        # 应用其余新值
         for key, value in self.updates.items():
+            if key == "check_count":
+                continue
             setattr(char, key, value)
 
         # check_count 变更可能使选中 cp 越界，自动顺延
@@ -229,7 +304,17 @@ class UpdateCharacterCommand(Command):
             if sentence:
                 char = sentence.get_character(self.char_idx)
                 if char:
+                    # 先还原 check_count 联动状态（timestamps/ruby 逐位还原，
+                    # 不走 set_check_count——重分段无法保证还原出原分段）
+                    if self._old_check_count_state is not None:
+                        char.check_count = self._old_check_count_state["check_count"]
+                        char.timestamps = list(self._old_check_count_state["timestamps"])
+                        char.ruby = deepcopy(self._old_check_count_state["ruby"])
+                        char._update_offset_timestamps()
+                        char.push_to_ruby()
                     for key, value in self._old_values.items():
+                        if key == "check_count":
+                            continue
                         setattr(char, key, value)
 
     @property
@@ -403,24 +488,120 @@ class RemoveSingerCommand(Command):
         self.singer_id = singer_id
         self.transfer_to = transfer_to
         self._singer = None
-        self._sentences = []
+        # 被删除（或被改写句级 singer_id）的句子 → (删除前索引, sentence)
+        self._sentences: List[Tuple[int, Sentence]] = []
+        # 保留句子中被改写的逐字 singer_id → {sentence_id: [(char_idx, 原值)]}
+        self._char_singer_ids: Dict[str, List[Tuple[int, str]]] = {}
 
     def execute(self) -> None:
         self._singer = self.project.get_singer(self.singer_id)
         if self._singer:
+            # 记录删除前状态，undo 按位还原句子顺序与逐字 singer_id
             self._sentences = [
-                s for s in self.project.sentences if s.singer_id == self.singer_id
+                (i, s)
+                for i, s in enumerate(self.project.sentences)
+                if s.singer_id == self.singer_id
             ]
+            # 逐字 singer_id：转移场景下 _sentences 内的句子保留但逐字被改写，
+            # 级联场景下保留句子的逐字也可能被改写——统一全量记录
+            self._char_singer_ids = {}
+            for s in self.project.sentences:
+                hits = [
+                    (ci, ch.singer_id)
+                    for ci, ch in enumerate(s.characters)
+                    if ch.singer_id == self.singer_id
+                ]
+                if hits:
+                    self._char_singer_ids[s.id] = hits
             self.project.remove_singer(self.singer_id, self.transfer_to)
 
     def undo(self) -> None:
         if self._singer:
             self.project.add_singer(self._singer)
-            for sentence in self._sentences:
+            for idx, sentence in self._sentences:
+                # 还原句级 singer_id（级联删除场景原值即本演唱者）
                 sentence.singer_id = self.singer_id
                 if sentence not in self.project.sentences:
-                    self.project.add_sentence(sentence)
+                    if 0 <= idx <= len(self.project.sentences):
+                        self.project.sentences.insert(idx, sentence)
+                    else:
+                        self.project.sentences.append(sentence)
+            # 还原保留句子中的逐字 singer_id
+            for sentence in self.project.sentences:
+                for ci, old_singer_id in self._char_singer_ids.get(sentence.id, []):
+                    char = sentence.get_character(ci)
+                    if char:
+                        char.singer_id = old_singer_id
+            self.project._update_timestamp()
 
     @property
     def description(self) -> str:
         return "删除演唱者"
+
+
+class TagAndDeleteNextCommand(SentenceSnapshotCommand):
+    """「打轴并删除下一节奏点」的窄快照撤销命令。
+
+    只快照受影响的一到两个 Character（写入者 + 被删节奏点所属字符，可能为
+    同一字符），避免每次按键对整个 ``project.sentences`` 做 2 次 deepcopy。
+
+    刻意继承 SentenceSnapshotCommand：前端按 ``isinstance(cmd,
+    SentenceSnapshotCommand)`` 走结构化刷新路径，undo_position /
+    redo_position / move_cp 光标恢复语义保持不变。
+    """
+
+    def __init__(
+        self,
+        project: Project,
+        entries: List[Tuple[str, int, Dict[str, Any], Dict[str, Any]]],
+        description: str,
+    ):
+        self._project = project
+        # [(sentence_id, char_idx, before_state, after_state)]
+        self._entries = entries
+        self._description = description
+        self.undo_position: Optional[Tuple[int, int]] = None
+        """撤销后应恢复的光标位置 ``(line_idx, char_idx)``。"""
+        self.redo_position: Optional[Tuple[int, int]] = None
+        """重做后应恢复的光标位置 ``(line_idx, char_idx)``。"""
+        self.move_cp: bool = True
+        """撤销/重做后是否需要调用 timing_service.move_to_checkpoint 同步打轴位置。"""
+
+    @staticmethod
+    def _capture_state(char: Character) -> Dict[str, Any]:
+        """捕获单个字符的打轴相关状态（check_count / 时间戳 / 停顿点 / ruby）。"""
+        return {
+            "check_count": char.check_count,
+            "timestamps": list(char.timestamps),
+            "sentence_end_ts": char.sentence_end_ts,
+            "is_sentence_end": char.is_sentence_end,
+            "ruby": deepcopy(char.ruby),
+        }
+
+    @classmethod
+    def _apply_state(
+        cls, project: Project, sentence_id: str, char_idx: int, state: Dict[str, Any]
+    ) -> None:
+        sentence = project.get_sentence(sentence_id)
+        if not sentence:
+            return
+        char = sentence.get_character(char_idx)
+        if not char:
+            return
+        char.check_count = state["check_count"]
+        char.timestamps = list(state["timestamps"])
+        char.sentence_end_ts = state["sentence_end_ts"]
+        char.is_sentence_end = state["is_sentence_end"]
+        char.ruby = deepcopy(state["ruby"])
+        char._update_offset_timestamps()
+        char.push_to_ruby()
+
+    def execute(self) -> None:
+        for sentence_id, char_idx, _before, after in self._entries:
+            self._apply_state(self._project, sentence_id, char_idx, after)
+        self._project._update_timestamp()
+
+    def undo(self) -> None:
+        for sentence_id, char_idx, before, _after in reversed(self._entries):
+            self._apply_state(self._project, sentence_id, char_idx, before)
+        self._project._update_timestamp()

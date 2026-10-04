@@ -300,15 +300,33 @@ class Character:
         Args:
             timestamp_ms: 时间戳（毫秒）
             checkpoint_idx: 指定写入的 checkpoint 索引（-1 = 追加到末尾）
+
+        Raises:
+            ValidationError: 时间戳为负、索引越界，或稀疏写入目标位之前
+                无任何时间戳可回填空位
         """
         if timestamp_ms < 0:
             raise ValidationError(f"时间戳不能为负数: {timestamp_ms}")
         if checkpoint_idx >= self.check_count:
             raise ValidationError("普通节奏点索引超出范围")
         if checkpoint_idx >= 0:
-            while len(self.timestamps) <= checkpoint_idx:
-                self.timestamps.append(0)
-            self.timestamps[checkpoint_idx] = timestamp_ms
+            # 稀疏打轴（跳过前面 cp 直接写后位）需要回填空位：
+            # 用前一 cp 的时间戳填充，避免产生破坏单调性的 0ms 伪时间戳；
+            # 无前一 cp 时间戳可回填（timestamps 为空且目标位 > 0）时拒绝写入。
+            if len(self.timestamps) < checkpoint_idx:
+                if not self.timestamps:
+                    raise ValidationError(
+                        f"稀疏打轴被拒绝：cp {checkpoint_idx} 之前的节奏点尚未打轴，"
+                        "无时间戳可回填空位"
+                    )
+                self.timestamps.extend(
+                    [self.timestamps[-1]] * (checkpoint_idx - len(self.timestamps))
+                )
+            if len(self.timestamps) == checkpoint_idx:
+                # 目标位正好是下一个空槽（含首写 len == checkpoint_idx == 0）
+                self.timestamps.append(timestamp_ms)
+            else:
+                self.timestamps[checkpoint_idx] = timestamp_ms
         else:
             self.timestamps.append(timestamp_ms)
         self._update_offset_timestamps()

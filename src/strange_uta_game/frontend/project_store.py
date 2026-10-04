@@ -104,6 +104,10 @@ class ProjectStore(QObject):
         self._dirty = False
         # 每次 load_project 递增，用于防止异步保存回调在项目被替换后覆盖 _save_path。
         self._load_count: int = 0
+        # 编辑代数：任何把 _dirty 置 True 的修改都会递增。手动保存发起时记录
+        # 当前值，完成回调仅在代数未变（保存窗口期没有新编辑）时清 dirty，
+        # 避免异步写盘期间的新编辑被误标"已保存"而静默丢失。
+        self._edit_epoch: int = 0
 
         # 防抖保存到 .sug.temp（2 秒无操作后写，用于闪退恢复）
         self._periodic_save_timer = QTimer(self)
@@ -163,6 +167,7 @@ class ProjectStore(QObject):
         self._original_media_path = path
         if self._project:
             self._dirty = True
+            self._edit_epoch += 1
             self._schedule_auto_save()
 
     def restore_media_path(self, path: Optional[str]) -> None:
@@ -181,6 +186,7 @@ class ProjectStore(QObject):
         if not self._project:
             return
         self._dirty = True
+        self._edit_epoch += 1
         self._schedule_auto_save()
         self.data_changed.emit("dirty")
 
@@ -368,6 +374,9 @@ class ProjectStore(QObject):
 
         所有 UI 模块应在收到 ``data_changed("project")`` 后全量刷新。
         """
+        # 先停掉旧项目的在途保存线程：否则其完成回调可能在 cleanup 之后
+        # 把旧项目数据写回临时文件，"复活"刚删掉的 .temp，污染闪退恢复。
+        self._stop_save_threads()
         # 清理旧项目的临时文件
         if self._project:
             self.cleanup_temp_files()
@@ -383,10 +392,12 @@ class ProjectStore(QObject):
 
     def close_project(self) -> None:
         """关闭当前项目。"""
-        self.cleanup_temp_files()
+        # 与 load_project 同理：先停在途保存线程，再清理临时文件，
+        # 避免线程完成回调把旧项目写回刚删掉的 .temp。
+        self._stop_save_threads()
         self._auto_save_timer.stop()
         self._periodic_save_timer.stop()
-        self._stop_save_threads()
+        self.cleanup_temp_files()
         self._project = None
         self._save_path = None
         self._dirty = False
@@ -413,6 +424,7 @@ class ProjectStore(QObject):
         # 设置和音频路径变更不算项目内容修改
         if change_type not in ("settings", "audio"):
             self._dirty = True
+            self._edit_epoch += 1
             self._schedule_auto_save()
         self.data_changed.emit(change_type)
 
@@ -439,7 +451,8 @@ class ProjectStore(QObject):
             path: 保存路径。如果为 None 使用上次路径。
 
         Returns:
-            是否成功发起保存。
+            是否成功发起保存。False 表示未能发起（无项目 / 无路径 /
+            同槽位已有保存在进行中被跳过——调用方不应把跳过当作成功）。
         """
         if not self._project:
             return False
@@ -451,17 +464,21 @@ class ProjectStore(QObject):
         # 捕获当前版本号：若保存期间 load_project 被调用（项目被替换），
         # 回调中版本号不匹配时不覆盖新项目的 _save_path。
         load_count_at_save = self._load_count
+        # 捕获当前编辑代数：序列化与本回调之间的窗口期若有新编辑
+        # （edit_epoch 递增），完成回调不清 dirty，避免误标"已保存"。
+        edit_epoch_at_save = self._edit_epoch
 
         def _on_finished(saved_path: str) -> None:
-            self._on_manual_save_finished(saved_path, load_count_at_save)
+            self._on_manual_save_finished(
+                saved_path, load_count_at_save, edit_epoch_at_save
+            )
 
-        self._launch_save(
+        return self._launch_save(
             target,
             on_finished=_on_finished,
             on_error=self._on_manual_save_error,
             is_background=False,
         )
-        return True
 
     def _launch_save(
         self,
@@ -470,19 +487,20 @@ class ProjectStore(QObject):
         on_finished: Callable[[str], None],
         on_error: Callable[[str], None],
         is_background: bool,
-    ) -> None:
+    ) -> bool:
         """在后台线程执行一次保存。
 
         is_background=True 使用 _bg_save 槽位（auto/periodic），
         is_background=False 使用 _save 槽位（手动保存）。
-        同槽位有保存正在进行时跳过本次。
+        同槽位有保存正在进行时跳过本次并返回 ``False``，否则启动线程
+        返回 ``True``。
         """
         if is_background:
             if self._bg_save_thread is not None and self._bg_save_thread.isRunning():
-                return
+                return False
         else:
             if self._save_thread is not None and self._save_thread.isRunning():
-                return
+                return False
 
         # 主线程构建纯 dict 快照（几 ms），取代旧方案 deepcopy（大项目几十 ms 冻结）。
         # dict 不引用 domain 对象，后台写盘期间 UI 继续编辑不影响快照内容。
@@ -531,8 +549,14 @@ class ProjectStore(QObject):
             self.save_started.emit(file_path)
 
         thread.start()
+        return True
 
-    def _on_manual_save_finished(self, saved_path: str, load_count_at_save: int = -1) -> None:
+    def _on_manual_save_finished(
+        self,
+        saved_path: str,
+        load_count_at_save: int = -1,
+        edit_epoch_at_save: int = -1,
+    ) -> None:
         if load_count_at_save >= 0 and self._load_count != load_count_at_save:
             # 保存期间 load_project 被调用（项目已被替换），跳过 _save_path 更新，
             # 避免新项目误继承旧项目的保存路径。仍然广播保存成功信号供 UI 展示提示。
@@ -540,13 +564,31 @@ class ProjectStore(QObject):
             return
         old_path = self._save_path
         self._save_path = saved_path
-        self._dirty = False
+        # 仅当保存窗口期（序列化快照之后）没有新编辑时才清 dirty：
+        # 若编辑代数已变，说明有改动未落入本次保存的快照，必须保持
+        # dirty 让关闭提示 / 周期保存兜底继续生效，否则这些改动会被
+        # 误标"已保存"而静默丢失。
+        if edit_epoch_at_save < 0 or self._edit_epoch == edit_epoch_at_save:
+            self._dirty = False
         if old_path and old_path != saved_path:
             self._cleanup_temp_for_path(old_path)
         self.save_finished.emit(saved_path)
 
     def _on_manual_save_error(self, error_msg: str) -> None:
         self.save_error.emit(error_msg)
+
+    def wait_for_manual_save(self, timeout_ms: int = 10000) -> None:
+        """阻塞等待在途手动保存线程写盘完成（仅供应用退出路径调用）。
+
+        closeEvent 选"保存"后立即 ``QApplication.quit()`` 会把仍在写盘的
+        保存线程一并杀死，留下截断的 .sug；退出前必须等它自然结束。
+        无在途保存时立即返回。超时（磁盘卡死等）则放弃等待继续退出，
+        宁可保留 .temp 兜底也不无限卡住退出流程。
+        """
+        thread = self._save_thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait(timeout_ms)
 
     # ── 定时 auto-save 配置 ──────────────────────
 
@@ -730,19 +772,46 @@ class ProjectStore(QObject):
                     pass
 
     @staticmethod
+    def _legacy_temp_dirs() -> list[Path]:
+        """历史遗留的 .temp 目录（更改配置位置后未迁移成功的旧位置）。
+
+        「设置 → 关于/语言 → 更改位置」把迁移失败的旧 .temp 目录记录在
+        ``auto_save.legacy_temp_dirs``（见 about._change_config_dir），
+        恢复扫描纳入这些目录，避免旧位置的 .sug.temp 成为孤儿。
+        """
+        dirs: list[Path] = []
+        try:
+            from strange_uta_game.frontend.settings.app_settings import AppSettings
+            raw = AppSettings().get("auto_save.legacy_temp_dirs", []) or []
+        except Exception:
+            return dirs
+        if not isinstance(raw, list):
+            return dirs
+        for item in raw:
+            try:
+                d = Path(str(item))
+                if d.is_dir() and d not in dirs:
+                    dirs.append(d)
+            except (OSError, ValueError):
+                continue
+        return dirs
+
+    @staticmethod
     def _crash_recovery_dirs() -> list[Path]:
         """闪退恢复文件可能所在的目录。
 
-        扫描三个位置（去重）：
+        扫描（去重）：
         1. 当前 .temp（受用户自定义备份目录影响）
         2. 默认 .temp（用户从默认位置改为自定义路径后，旧恢复文件仍可被检测/清理）
         3. 旧版 .cache（升级兼容）
+        4. 历史遗留位置（更改配置位置后未迁移成功的旧 .temp）
         """
         dirs: list[Path] = []
         for d in (
             _temp_dir(),
             app_dirs.default_backup_dir() / ".temp",
             _cache_dir(),
+            *ProjectStore._legacy_temp_dirs(),
         ):
             if d not in dirs:
                 dirs.append(d)
@@ -781,14 +850,23 @@ class ProjectStore(QObject):
                 except Exception:
                     pass
 
-        # 检查其他项目的恢复文件
+        # 检查其他项目的恢复文件：按修改时间降序（最新的优先），
+        # 多项目恢复文件并存时恢复最近编辑的那个，而不是 glob 顺序第一个。
+        candidates: list[Path] = []
         for d in ProjectStore._crash_recovery_dirs():
-            for temp_file in d.glob(".*.sug.temp"):
-                try:
-                    project, extras = SugProjectParser.load_with_extras(str(temp_file))
-                    return project, str(temp_file), extras
-                except Exception:
-                    continue
+            try:
+                candidates.extend(d.glob(".*.sug.temp"))
+            except OSError:
+                continue
+        candidates.sort(
+            key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True
+        )
+        for temp_file in candidates:
+            try:
+                project, extras = SugProjectParser.load_with_extras(str(temp_file))
+                return project, str(temp_file), extras
+            except Exception:
+                continue
         return None
 
     @staticmethod

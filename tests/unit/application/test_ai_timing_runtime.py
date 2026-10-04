@@ -573,3 +573,120 @@ def test_fetch_manifest_rotates_to_mirror(monkeypatch):
 def test_pip_default_index_is_aliyun():
     """pip 默认索引 = 阿里源（官方 PyPI 国内直连常超时）。"""
     assert rt.PIP_DEFAULT_INDEX == "https://mirrors.aliyun.com/pypi/simple/"
+
+
+# ── G7/G8：解压 zip-slip 防护与 .part 残留清理 ──
+
+
+def test_release_extract_rejects_zip_slip_member(monkeypatch, tmp_path):
+    """G7：底座 zip 含 ../ 逃逸条目（第三方镜像投毒场景）→ 拒绝解压，
+    逃逸文件不得落盘。"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("runtime/python.exe", b"fake")
+        zf.writestr("../evil.txt", b"pwned")
+    zip_bytes = buf.getvalue()
+
+    def _fetch(variant, *, proxy=""):
+        return _manifest_for(zip_bytes)
+
+    monkeypatch.setattr(rt, "detect_nvidia_gpu", lambda: "")
+    monkeypatch.setattr(
+        rt,
+        "explain_release_variant",
+        lambda: (RUNTIME_VARIANT_CPU, "测试强制 CPU 变体"),
+    )
+    _patch_download(
+        monkeypatch,
+        {"http://fake/base.zip.001": zip_bytes, "http://fake/torch.whl": b"12345678"},
+    )
+
+    target = tmp_path / "ai_runtime"
+    manager = rt.AiRuntimeManager(pip_runner=_fake_pip_runner())
+    with pytest.raises(rt.AiRuntimeError, match="非法路径条目"):
+        manager.install_from_release(
+            target,
+            progress=lambda p, m: None,
+            manifest_fetch=_fetch,
+        )
+    assert not (tmp_path / "evil.txt").exists()
+    assert not (target / "evil.txt").exists()
+
+    # 合法 zip 不受影响（快路径测试覆盖正常安装，这里补：无 .. 条目
+    # 时 _safe_extract_path 全部放行）
+    good_bytes = _zip_with_runtime()
+    _patch_download(
+        monkeypatch,
+        {"http://fake/base.zip.001": good_bytes, "http://fake/torch.whl": b"12345678"},
+    )
+
+    def _fetch_ok(variant, *, proxy=""):
+        return _manifest_for(good_bytes)
+
+    shared_calls = []
+    monkeypatch.setattr(
+        rt.AiRuntimeManager, "install_shared", _stub_shared(calls=shared_calls)
+    )
+    target2 = tmp_path / "ai_runtime2"
+    status = manager.install_from_release(
+        target2,
+        progress=lambda p, m: None,
+        manifest_fetch=_fetch_ok,
+    )
+    assert status.available is True
+    assert (target2 / "runtime" / "python.exe").is_file()
+
+
+def test_download_verified_cleans_part_on_cancel(monkeypatch, tmp_path):
+    """G8：取消后 .part 必须被清理——staging 断点从不复用（每源全新
+    写入），残留只会变成 ~3.2GB 磁盘死重并干扰空间预检。"""
+
+    class _CancelAfterFirst:
+        def __init__(self):
+            self.n = 0
+
+        def __call__(self):
+            self.n += 1
+            return self.n > 1
+
+    monkeypatch.setattr(
+        rt, "_github_mirror_candidates", lambda url, order=None: [url]
+    )
+    monkeypatch.setattr("requests.get", lambda url, **k: _FakeResp(b"hello-runtime"))
+    dest = tmp_path / "x.zip"
+    part = dest.with_name(dest.name + ".part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(rt.AiRuntimeError, match="已取消"):
+        rt._download_verified(
+            GH_URL,
+            dest,
+            expected_size=len(b"hello-runtime"),
+            expected_sha256="0" * 64,
+            cancel=_CancelAfterFirst(),
+        )
+    assert not part.exists()
+    assert not dest.exists()
+
+
+def test_download_verified_cleans_part_on_all_sources_fail(monkeypatch, tmp_path):
+    """G8：所有下载源失败 → 无效 .part 一并清理。"""
+    monkeypatch.setattr(
+        rt, "_github_mirror_candidates", lambda url, order=None: [url]
+    )
+
+    def fake_get(url, **kwargs):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr("requests.get", fake_get)
+    dest = tmp_path / "x.zip"
+    part = dest.with_name(dest.name + ".part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"stale-from-previous-attempt")
+    with pytest.raises(rt.AiRuntimeError, match="下载失败"):
+        rt._download_verified(
+            GH_URL,
+            dest,
+            expected_size=1,
+            expected_sha256="0" * 64,
+        )
+    assert not part.exists()

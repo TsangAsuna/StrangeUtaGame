@@ -554,6 +554,8 @@ class AiTimingDialog(QDialog):
         self.btn_cancel.setEnabled(True)
         for b in self._action_buttons():
             b.setEnabled(False)
+        for w in self._advanced_widgets():
+            w.setEnabled(False)
         self.status_label.setText(busy_text)
         self.eta_label.setText("")
         self._last_eta_text = ""
@@ -574,6 +576,10 @@ class AiTimingDialog(QDialog):
             sig.connect(self._cleanup_task)
         self._worker.finished.connect(on_done)
         self._worker.failed.connect(self._on_task_failed)
+        # 线程结束后延迟销毁 worker 与线程对象（同 fulltext_interface）：
+        # 长会话反复跑任务时不再累积 QThread/QObject
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
     def _action_buttons(self) -> list:
@@ -584,6 +590,16 @@ class AiTimingDialog(QDialog):
             self.btn_recheck,
             self.btn_reset,
             # 日志按钮保持可用：任务进行中打开日志看实时进展也是正当需求
+        ]
+
+    def _advanced_widgets(self) -> list:
+        """高级选项控件：任务进行中一并禁用（改 provider/device/镜像/
+        运行环境会让在途任务与设置处于不一致状态）。"""
+        return [
+            self.combo_model,
+            self.combo_device,
+            self.combo_mirror,
+            self.edit_mirror,
         ]
 
     def _cleanup_task(self) -> None:
@@ -597,6 +613,8 @@ class AiTimingDialog(QDialog):
         self.btn_cancel.setEnabled(False)
         for b in self._action_buttons():
             b.setEnabled(True)
+        for w in self._advanced_widgets():
+            w.setEnabled(True)
 
     def _on_task_progress(self, stage: str, percent: int, message: str) -> None:
         self.progress.setValue(max(0, min(100, percent)))
@@ -1440,6 +1458,11 @@ class AiTimingDialog(QDialog):
             self.refresh()
 
     def _on_change_runtime(self) -> None:
+        if self._busy:
+            # 任务运行中换解释器：在途任务仍持旧环境句柄，且安装/对齐
+            # 期间解释器文件被锁定，与路径类更改同口径拦截
+            self._notify_busy_path_change()
+            return
         # 未显式选择过解释器时，从当前解释器所在目录开始
         start = self._settings.runtime_python or str(Path(sys.executable).parent)
         chosen, _filter = QFileDialog.getOpenFileName(
@@ -1618,7 +1641,14 @@ class AiTimingDialog(QDialog):
         # 等待后台线程收尾，避免线程销毁竞态（§9 Qt teardown 坑）
         if self._thread is not None:
             self._thread.quit()
-            self._thread.wait(5000)
+            if not self._thread.wait(5000):
+                # 宽限期内未退出（CUDA 上下文释放/模型卸载可能远超 5s，
+                # 对齐子进程按取消流程收尾也要时间）：不能销毁仍在运行的
+                # QThread（本对话框为父，析构即 "Destroyed while thread is
+                # still running" 崩溃）——摘掉父子关系保持引用延迟销毁，
+                # 线程结束后经 finished → deleteLater 自行回收；worker
+                # 子进程由上面的取消请求经 service 的取消接线终止
+                self._thread.setParent(None)
         super().closeEvent(event)
 
 

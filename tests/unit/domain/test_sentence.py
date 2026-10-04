@@ -158,3 +158,52 @@ class TestSentence:
 
         assert result is True
         assert sentence.characters == []
+
+
+class TestInsertCharacterLineEndMigration:
+    """insert_character 的行尾标记迁移规约（C6）。"""
+
+    def _sentence(self):
+        return Sentence(
+            singer_id="s1",
+            characters=[
+                Character(char="a", singer_id="s1"),
+                Character(char="b", singer_id="s1", is_line_end=True),
+            ],
+        )
+
+    def test_insert_after_line_end_migrates_marker(self):
+        """插入点越过行尾字（追加到行尾之后）：标记迁移到新字符"""
+        sentence = self._sentence()
+        sentence.insert_character(2, Character(char="c", singer_id="s1"))
+
+        assert [c.char for c in sentence.characters] == ["a", "b", "c"]
+        assert sentence.characters[1].is_line_end is False
+        assert sentence.characters[2].is_line_end is True
+
+    def test_insert_before_line_end_keeps_marker(self):
+        """插入点在行尾字之前：标记留在原行尾字上"""
+        sentence = self._sentence()
+        sentence.insert_character(1, Character(char="x", singer_id="s1"))
+
+        assert [c.char for c in sentence.characters] == ["a", "x", "b"]
+        assert sentence.characters[1].is_line_end is False
+        assert sentence.characters[2].is_line_end is True
+
+    def test_insert_char_with_preexisting_marker_mid_line_clears_it(self):
+        """自带行尾标记的字符插入行中：清掉其标记，保持单行尾不变式"""
+        sentence = self._sentence()
+        sentence.insert_character(
+            0, Character(char="x", singer_id="s1", is_line_end=True)
+        )
+
+        assert [c.char for c in sentence.characters] == ["x", "a", "b"]
+        assert sentence.characters[0].is_line_end is False
+        assert sentence.characters[2].is_line_end is True
+
+    def test_insert_into_empty_sentence_marks_line_end(self):
+        """空行插入：新字符成为行尾字（既有行为不变）"""
+        sentence = Sentence(singer_id="s1")
+        sentence.insert_character(0, Character(char="a", singer_id="s1"))
+
+        assert sentence.characters[0].is_line_end is True

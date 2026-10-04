@@ -268,7 +268,12 @@ class ModelDownloadTransport(ABC):
 
     @abstractmethod
     def list_files(self, repo_id: str, revision: str) -> List[Tuple[str, int]]:
-        """返回 [(filename, size_bytes)]，按文件名排序。"""
+        """返回 [(filename, size_bytes)]，按文件名排序。
+
+        实现可选择性升级为 ``(filename, size_bytes, sha256)`` 三元组
+        （sha256 = 远端 LFS oid）：下载编排据此做远端完整性比对；
+        二元组仍受支持（跳过比对）。
+        """
 
     @abstractmethod
     def download_file(
@@ -281,22 +286,29 @@ class ModelDownloadTransport(ABC):
         expected_size: int,
         progress: PROGRESS_CB,
         cancel: CANCEL_CB,
+        expected_sha256: Optional[str] = None,
     ) -> None:
         """下载单个文件到 dest（原子：完成前写 .part）。
 
         progress 按本文件 0-100 回调（字节级真实进度）；cancel 在传输
-        块之间被检查，必须可及时中断。
+        块之间被检查，必须可及时中断。``expected_sha256``（远端 LFS
+        oid）可得时，断点续传前须校验 .part 前缀与远端一致。
         """
 
 
 def filter_model_files(files: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
-    """按白名单过滤所需文件（排除 TF/Flax/ONNX 冗余权重）。"""
+    """按白名单过滤所需文件（排除 TF/Flax/ONNX 冗余权重）。
+
+    条目兼容 ``(name, size)`` 与 ``(name, size, sha256)`` 两种形态，
+    返回时保持原形态（sha256 为远端 LFS oid，透传给下载编排做完整性
+    比对，防止损坏权重「自证」校验通过）。
+    """
     return [
-        (name, size)
-        for name, size in files
-        if name not in _EXCLUDED_NAMES
-        and Path(name).suffix.lower() in _INCLUDED_EXTENSIONS
-        and ".cache" not in name.split("/")
+        item
+        for item in files
+        if item[0] not in _EXCLUDED_NAMES
+        and Path(item[0]).suffix.lower() in _INCLUDED_EXTENSIONS
+        and ".cache" not in item[0].split("/")
     ]
 
 
@@ -355,7 +367,10 @@ class HfHubTransport(ModelDownloadTransport):
             size = int(
                 (item.get("lfs") or {}).get("size") or item.get("size") or 0
             )
-            result.append((name, size))
+            # 保留 LFS oid（远端 sha256）：下载完成后与本地内容比对，
+            # 完整性以远端为准而非 manifest 自算哈希
+            oid = (item.get("lfs") or {}).get("oid")
+            result.append((name, size, str(oid) if oid else None))
         return sorted(result)
 
     def download_file(
@@ -368,6 +383,7 @@ class HfHubTransport(ModelDownloadTransport):
         expected_size: int,
         progress: PROGRESS_CB,
         cancel: CANCEL_CB,
+        expected_sha256: Optional[str] = None,
     ) -> None:
         import requests
 
@@ -375,6 +391,32 @@ class HfHubTransport(ModelDownloadTransport):
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + PART_SUFFIX)
         offset = part.stat().st_size if part.is_file() else 0
+        if offset and expected_size and offset > expected_size:
+            # .part 比目标文件还大：来自旧版本/其他来源的残留，不可续传
+            part.unlink(missing_ok=True)
+            offset = 0
+        if offset and expected_sha256:
+            # 断点续传前校验 .part 前缀：抽头 64KB 与远端比对，防止把
+            # 旧版本文件接上新版本尾巴（最终 sha256 比对会兜底，这里
+            # 提前止损省一次整文件重拉）；探测失败按可续传处理
+            try:
+                probe = requests.get(
+                    url,
+                    headers={"Range": f"bytes=0-{min(offset, 65536) - 1}"},
+                    timeout=self._TIMEOUT,
+                    **self._proxies_kwargs(),
+                )
+                probe.raise_for_status()
+                with part.open("rb") as fh:
+                    local_prefix = fh.read(min(offset, 65536))
+                remote_prefix = b""
+                for chunk in probe.iter_content(chunk_size=self._CHUNK):
+                    remote_prefix += chunk
+                if remote_prefix[: len(local_prefix)] != local_prefix:
+                    part.unlink(missing_ok=True)
+                    offset = 0
+            except Exception:
+                pass  # 前缀探测失败不阻断：最终 sha256 比对兜底
 
         headers = {"Range": f"bytes={offset}-"} if offset else {}
         try:
@@ -521,14 +563,18 @@ class ModelDownloadService:
         model_dir = self._registry.model_dir(model_id)
         model_dir.mkdir(parents=True, exist_ok=True)
         progress(2, "获取模型文件列表")
+        # transport 条目兼容 (name, size) 与 (name, size, sha256)：
+        # sha256 = 远端 LFS oid（可得时下载后必须比对）
         files = filter_model_files(
-            self._transport.list_files(model_id, revision)
+            list(self._transport.list_files(model_id, revision))
         )
         if not files:
             raise ModelRegistryError(f"模型仓库中没有可下载的文件：{model_id}")
 
         entries: List[ModelFileEntry] = []
-        for i, (filename, size) in enumerate(files):
+        for i, item in enumerate(files):
+            filename, size = str(item[0]), int(item[1])
+            remote_sha = str(item[2]) if len(item) > 2 and item[2] else None
             if cancel():
                 raise ModelRegistryError("已取消")
             base = int(5 + 90 * i / len(files))
@@ -549,6 +595,9 @@ class ModelDownloadService:
             if size > 0 and dest.is_file() and dest.stat().st_size == size:
                 progress(base + span, f"复用已下载文件 {filename}")
             else:
+                extra = (
+                    {"expected_sha256": remote_sha} if remote_sha else {}
+                )
                 self._transport.download_file(
                     model_id,
                     revision,
@@ -559,6 +608,7 @@ class ModelDownloadService:
                         min(95, _b + int(p * _s / 100)), m
                     ),
                     cancel=cancel,
+                    **extra,
                 )
             if not dest.is_file():
                 raise ModelRegistryError(f"下载后文件不存在：{filename}")
@@ -566,11 +616,22 @@ class ModelDownloadService:
                 raise ModelRegistryError(
                     f"下载 {filename} 大小不符（{dest.stat().st_size}/{size} 字节）"
                 )
+            actual_sha = sha256_of_file(dest)
+            if remote_sha and actual_sha != remote_sha:
+                # 远端 sha256 比对失败：删掉坏文件与断点，避免下次再被
+                # 「复用」；manifest 不落盘，模型保持未注册
+                dest.unlink(missing_ok=True)
+                part = dest.with_name(dest.name + PART_SUFFIX)
+                part.unlink(missing_ok=True)
+                raise ModelRegistryError(
+                    f"下载 {filename} 完整性校验失败（与远端 sha256 不符，"
+                    "文件可能损坏或被篡改），请重试下载"
+                )
             entries.append(
                 ModelFileEntry(
                     filename=filename,
                     size=dest.stat().st_size,
-                    sha256=sha256_of_file(dest),
+                    sha256=actual_sha,
                 )
             )
 

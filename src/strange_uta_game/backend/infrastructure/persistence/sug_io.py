@@ -10,6 +10,7 @@ StrangeUtaGame 项目文件格式 (.sug)
 """
 
 import json
+import os
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
@@ -24,7 +25,6 @@ from strange_uta_game.backend.domain import (
     Character,
     Ruby,
     RubyPart,
-    DomainError,
 )
 from strange_uta_game.backend.domain.models import (
     RUBY_PAUSE_SENTINEL,
@@ -227,9 +227,13 @@ class SugMigrator:
             if i in tag_map:
                 tag_indices = sorted(tag_map[i].keys())
                 if tag_indices:
-                    max_idx = tag_indices[-1]
-                    for cp_idx in range(max_idx + 1):
-                        timestamps.append(tag_map[i].get(cp_idx, 0))
+                    # 缺失的 cp_idx 不再填 0——那会把「未打轴的节奏点」
+                    # 伪造成「0ms 打轴」（歌曲开头凭空多一个轴点）。
+                    # 按 v2 语义取连续前缀，在首个缺口处截断
+                    for cp_idx in range(tag_indices[-1] + 1):
+                        if cp_idx not in tag_map[i]:
+                            break
+                        timestamps.append(tag_map[i][cp_idx])
 
             char_dict: Dict[str, Any] = {
                 "char": ch,
@@ -312,13 +316,28 @@ class SugProjectParser:
 
     @staticmethod
     def write(data: Dict[str, Any], file_path: str, *, progress_cb=None) -> None:
-        """将 serialize 产出的 dict 快照写入 SUG 文件（可放后台线程）。"""
+        """将 serialize 产出的 dict 快照写入 SUG 文件（可放后台线程）。
+
+        原子写：先写同目录临时文件再 ``os.replace`` 替换正式文件，
+        写盘中途崩溃 / 断电不会留下截断的正式项目文件
+        （os.replace 在同盘同目录下是原子操作）。
+        """
         path = Path(file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if progress_cb:
             progress_cb("正在写入文件...")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        temp_path = path.with_name(path.name + ".tmp")
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, path)
+        except Exception:
+            # 兜底清理临时文件；正式文件保持上一次写盘的完整内容
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def load(file_path: str) -> Project:
@@ -360,7 +379,9 @@ class SugProjectParser:
             raise SugParseError(f"文件不存在: {file_path}")
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # utf-8-sig：兼容带 BOM 的存档（某些编辑器保存 .sug 时会写入
+            # BOM），同时无损读取无 BOM 的常规文件
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
 
         except json.JSONDecodeError as e:
@@ -376,14 +397,18 @@ class SugProjectParser:
         if "media_path" in data:
             extras["media_path"] = data["media_path"]
 
-        # 版本检查和迁移
-        version = data.get("version", "1.0")
-        if version != SugMigrator.CURRENT_VERSION:
-            data = SugMigrator.migrate(data, version)
-
         try:
+            # 版本检查和迁移（与 _dict_to_project 同一捕获面：损坏的旧版
+            # 数据在迁移中途抛出的裸 ValueError/AttributeError 等统一转
+            # SugParseError，不再直接炸到调用方）
+            version = data.get("version", "1.0")
+            if version != SugMigrator.CURRENT_VERSION:
+                data = SugMigrator.migrate(data, version)
+
             project = SugProjectParser._dict_to_project(data)
-        except (ValueError, KeyError, TypeError, DomainError) as e:
+        except SugParseError:
+            raise
+        except Exception as e:
             raise SugParseError(f"项目数据解析失败: {e}") from e
 
         return project, extras

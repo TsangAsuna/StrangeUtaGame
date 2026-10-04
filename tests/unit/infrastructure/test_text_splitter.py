@@ -179,3 +179,23 @@ class TestSplitText:
         chars, counts = split_text("사랑해")
         assert chars == ["사", "랑", "해"]
         assert counts == [1, 1, 1]
+
+
+class TestHalfWidthKatakanaE11:
+    """E11：半角片假名（U+FF66–FF9F）归 KATAKANA，不再被 isalpha 兜底
+    归 ALPHABET；U+FF61–FF65 半角标点仍归 SYMBOL。"""
+
+    def test_halfwidth_katakana_is_katakana(self):
+        for ch in "ｦｱｲｳｴｵｶｷｸﾝﾞﾟ":
+            assert get_char_type(ch) == CharType.KATAKANA, ch
+
+    def test_halfwidth_long_vowel_still_long_vowel(self):
+        assert get_char_type("ｰ") == CharType.LONG_VOWEL
+
+    def test_halfwidth_punctuation_stays_symbol(self):
+        for ch in "｡｢｣､･":
+            assert get_char_type(ch) == CharType.SYMBOL, ch
+
+    def test_halfwidth_katakana_counts_as_japanese(self):
+        splitter = AutoSplitter()
+        assert splitter.detect_language("ﾃｽﾄ") == "ja"

@@ -121,8 +121,12 @@ class BassTsmEngine(IAudioEngine):
         self._output_latency_ms: int = 0
         self._initialized = False
         self._recovering = False
+        self._recovery_thread: Optional[threading.Thread] = None
         self._last_recovery_attempt = 0.0
         self._last_reported_ms: int = 0
+
+        # 设备恢复完成回调（BASS_Free 重建会话后失效 keysound/metronome 句柄）
+        self._device_recovered_cb: Optional[Callable[[], None]] = None
 
         self._stream_lock = threading.RLock()
 
@@ -292,8 +296,14 @@ class BassTsmEngine(IAudioEngine):
             return np.ascontiguousarray(data, np.float32), int(sr), int(data.shape[1])
         try:
             info = BASS_CHANNELINFO()
-            _bass.BASS_ChannelGetInfo(ds, ctypes.byref(info))
+            if not _bass.BASS_ChannelGetInfo(ds, ctypes.byref(info)):
+                raise AudioLoadError(f"BASS_ChannelGetInfo 失败: {path}")
             byte_len = _bass.BASS_ChannelGetLength(ds, BASS_POS_BYTE)
+            if byte_len == 0 or byte_len > (1 << 62):
+                # GetLength 失败时 BASS 返回 -1（c_uint64 下溢成 0xFFFF...），
+                # 直接 np.empty 会 MemoryError——照 bass_engine 同型守卫退回
+                # soundfile 解码。
+                raise AudioLoadError(f"BASS_ChannelGetLength 失败: {path}")
             total = int(byte_len // 4)
             raw = np.empty(max(total, 0), dtype=np.float32)
             off = 0
@@ -310,6 +320,17 @@ class BassTsmEngine(IAudioEngine):
             n = len(raw) // ch
             pcm = np.ascontiguousarray(raw[: n * ch].reshape(n, ch), np.float32)
             return pcm, int(info.freq) or 44100, ch
+        except AudioLoadError:
+            # BASS 元数据不可用：退回 soundfile 全量解码
+            try:
+                data, sr = sf.read(str(path), dtype="float32")
+            except Exception as exc:
+                raise AudioLoadError(
+                    f"BASS 读取音频元数据失败，且 soundfile 解码失败: {exc}"
+                ) from exc
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            return np.ascontiguousarray(data, np.float32), int(sr), int(data.shape[1])
         finally:
             _bass.BASS_StreamFree(ds)
 
@@ -344,7 +365,11 @@ class BassTsmEngine(IAudioEngine):
             if speed_min - 1e-9 <= speed <= speed_max + 1e-9:
                 # 不传 done_cb：预热任务完成后不触发 _on_render_ready，
                 # 实际速度只由用户指令（set_speed）管理。
-                self._cache.ensure(speed, priority=prio)
+                # check_only=True：只查存在性，绝不在调用线程（UI 线程、持
+                # _stream_lock）做整曲 MP3 同步解码——否则第二次打开同一首歌
+                # 时预热会逐档解码磁盘缓存并丢弃结果，UI 长阻塞 + GB 级无效
+                # 内存。真需要 PCM 时（换源/播放）由对应路径按需解码。
+                self._cache.ensure(speed, priority=prio, check_only=True)
                 prio += 1
 
     def _free_stream(self) -> None:
@@ -581,20 +606,42 @@ class BassTsmEngine(IAudioEngine):
     def _switch_to_file(self, q: float, path: str) -> None:
         cur_ms = self._read_position_ms(apply_latency=False)
         resume = self._state == PlaybackState.PLAYING
+        prev_is_tempo = self._is_tempo
+        prev_scale = self._speed_scale
+        prev_source = self._current_source_path
         self._is_tempo = False
         self._speed_scale = q
         self._current_source_path = path
-        self._build_stream_locked(target_original_ms=cur_ms, resume=resume)
+        if not self._build_stream_locked(target_original_ms=cur_ms, resume=resume):
+            # 建流失败：_build_stream_locked 失败时不动旧流，但模式标志已被
+            # 改写——不回滚的话 _effective_scale() 已按新速度换算而实际仍是
+            # 旧流，位置会整体跳变。恢复原标志，保留当前音源。
+            self._is_tempo = prev_is_tempo
+            self._speed_scale = prev_scale
+            self._current_source_path = prev_source
+            print(f"[TSM引擎] 切换音源失败（速度 {q:.2f}x），保留当前音源")
+            return
         kind = "原始 1.0x" if abs(q - 1.0) < 1e-9 else "预渲染（无损）"
         print(f"[TSM引擎] 切换音源 → {kind}，速度 {q:.2f}x，文件: {Path(path).name}")
 
     def _switch_to_tempo(self, speed: float) -> None:
         cur_ms = self._read_position_ms(apply_latency=False)
         resume = self._state == PlaybackState.PLAYING
+        prev_is_tempo = self._is_tempo
+        prev_scale = self._speed_scale
+        prev_source = self._current_source_path
+        prev_tempo_speed = self._tempo_speed
         self._is_tempo = True
         self._tempo_speed = speed
         self._current_source_path = self._source_1x_path
-        self._build_stream_locked(target_original_ms=cur_ms, resume=resume)
+        if not self._build_stream_locked(target_original_ms=cur_ms, resume=resume):
+            # 同 _switch_to_file：失败回滚模式标志，保留旧流一致性
+            self._is_tempo = prev_is_tempo
+            self._speed_scale = prev_scale
+            self._current_source_path = prev_source
+            self._tempo_speed = prev_tempo_speed
+            print(f"[TSM引擎] 切换实时变速失败（速度 {speed:.2f}x），保留当前音源")
+            return
         print(f"[TSM引擎] 切换音源 → 实时变速（临时，可能爆音），速度 {speed:.2f}x，后台渲染中...")
 
     def _retune_tempo(self, speed: float) -> None:
@@ -796,22 +843,51 @@ class BassTsmEngine(IAudioEngine):
         info = BASS_INFO()
         return not _bass.BASS_GetInfo(ctypes.byref(info))
 
-    def _recover_device(self, reason: str) -> bool:
-        """Synchronous, throttled device recovery. Returns success."""
+    def _recover_device(self, reason: str) -> None:
+        """Trigger device recovery off the calling thread.
+
+        Called from the position-poll path (UI 线程 60fps 轮询)；恢复含
+        BASS_Free + 全设备重建，可能耗时数百毫秒，同步执行会冻结界面
+        （BassEngine 有专门后台线程，注释 must never block——TSM 引擎补齐
+        同款模式）。去重后立即返回，恢复在守护线程完成并全程持
+        ``_stream_lock``；期间 get_position_ms/is_playing 返回最后已知位置。
+        """
         if self._recovering:
-            return self._stream != 0
+            return
         now = time.monotonic()
         if now - self._last_recovery_attempt < 1.0:
-            return False
+            return
         self._last_recovery_attempt = now
         self._recovering = True
+        t = threading.Thread(
+            target=self._run_recovery, args=(reason,), daemon=True, name="TsmRecovery"
+        )
+        self._recovery_thread = t
+        t.start()
+
+    def _run_recovery(self, reason: str) -> None:
+        try:
+            print(f"[TSM引擎] 设备恢复中（原因: {reason}）...")
+            with self._stream_lock:
+                self._do_recover_locked()
+        except Exception as exc:
+            print(f"[TSM引擎] 设备恢复失败: {exc}")
+        finally:
+            self._recovering = False
+
+    def _do_recover_locked(self) -> bool:
+        """Rebuild device + streams, preserving position/speed/mode.
+
+        Caller holds ``_stream_lock``. Returns True on success.
+        """
         pos = self._read_position_ms(apply_latency=False)
         resume = self._state == PlaybackState.PLAYING
         has_source = bool(self._current_source_path or self._source_1x_path)
+        freed = False
         try:
-            print(f"[TSM引擎] 设备恢复中（原因: {reason}）...")
             self._free_stream()
             _bass.BASS_Free()
+            freed = True
             self._initialized = False
             if not self._ensure_initialized() or not has_source:
                 self._state = PlaybackState.PAUSED
@@ -825,7 +901,24 @@ class BassTsmEngine(IAudioEngine):
             self._state = PlaybackState.PAUSED
             return False
         finally:
-            self._recovering = False
+            if freed:
+                # D10：BASS_Free 已使进程内所有 sample 句柄失效（按键音/
+                # 节拍器）。无论恢复成败都要通知 UI 层失效并重载样本；
+                # 回调在恢复线程上执行，UI 层须自行 marshal 回主线程。
+                if self._device_recovered_cb is not None:
+                    try:
+                        self._device_recovered_cb()
+                    except Exception as exc:
+                        print(f"[TSM引擎] 设备恢复回调执行出错: {exc}")
+
+    def set_device_recovered_callback(
+        self, callback: Optional[Callable[[], None]]
+    ) -> None:
+        """注册设备恢复回调（BASS_Free 重建会话后触发，见 IAudioEngine）。
+
+        回调在恢复线程上执行，UI 层不得在其中直接操作 Qt 对象。
+        """
+        self._device_recovered_cb = callback
 
     # ════════════════════════════════════ volume / callbacks / info
 

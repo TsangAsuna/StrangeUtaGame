@@ -437,6 +437,7 @@ class KaraokePreview(QWidget):
         self._scroll_mode: str = "auto"  # auto / always / never
         self._last_auto_scroll_line_idx: int = -1  # 上次自动滚动到的行（与 _current_line_idx 独立）
         self._line_switch_points: list[tuple[int, int]] = []  # [(switch_ms, line_idx)]
+        self._line_switch_points_dirty: bool = False  # 编辑后置脏，待下次使用前重建
         self._current_switch_idx: int = 0  # 当前快照位置
         self._SCROLL_SCALE = 1000  # 滚动条精度缩放因子（1行=1000单位）
 
@@ -556,6 +557,7 @@ class KaraokePreview(QWidget):
             if ts is not None:
                 self._line_switch_points.append((ts, idx))
         self._line_switch_points.sort()
+        self._line_switch_points_dirty = False
 
     def character_global_rect(self, line_idx: int, char_idx: int) -> QRect | None:
         """Return a rendered character hitbox in global screen coordinates."""
@@ -672,7 +674,12 @@ class KaraokePreview(QWidget):
     def set_focus_position(self, line_idx:int = 0,char_idx: int = 0):
         # 用于打轴状态下更新foucs
         new_line = float(line_idx)
-        if new_line == self._scroll_center_line and line_idx == self._current_char_idx:
+        # 快路径：视口已居中且行/字符均未变化时仅刷新 focus 域
+        # （行号对行号、字符号对字符号，此前曾错位比较导致 focus 行域残留旧值）
+        if (new_line == self._scroll_center_line
+                and line_idx == self._current_line_idx
+                and char_idx == self._current_char_idx):
+            self._focus_line_idx = line_idx
             self._focus_char_idx = char_idx
             self._focus_line_range_end = line_idx
             self._focus_char_range_end = char_idx
@@ -863,8 +870,9 @@ class KaraokePreview(QWidget):
         """
         if not self._project or not self._project.sentences:
             return set()
-        if not self._line_switch_points:
-            # 暂停 seek / 加载后未播放过时快照可能尚未构建
+        if not self._line_switch_points or self._line_switch_points_dirty:
+            # 暂停 seek / 加载后未播放过时快照可能尚未构建；
+            # 暂停期间的编辑会把快照置脏，局部重绘前必须重建
             self._build_line_switch_points()
         if not self._line_switch_points:
             return set()
@@ -1261,6 +1269,10 @@ class KaraokePreview(QWidget):
         total = len(sentences)
         if not (0 <= changed_idx < total):
             return
+
+        # 行内容变化可能改变行起始时间戳 → 换行快照置脏，
+        # 待 _wipe_affected_lines / set_playing 下次使用前重建
+        self._line_switch_points_dirty = True
 
         self._invalidate_line(changed_idx)
 
@@ -1760,8 +1772,15 @@ class KaraokePreview(QWidget):
             if char_rect.contains(click_x, click_y):
                 target_line_idx = line_idx
                 target_char_idx = char_idx
-                self._current_line_idx = line_idx
-                self._current_char_idx = char_idx
+                # 走 char_selected 链路同步 current 域（与左键一致），
+                # 不直写 _current_line_idx/_current_char_idx 绕过 timing_service；
+                # 抑制居中滚动，保持右键前视口不动。
+                self._suppress_click_recenter = True
+                try:
+                    self.char_selected.emit(line_idx, char_idx)
+                    self.line_clicked.emit(line_idx)
+                finally:
+                    self._suppress_click_recenter = False
                 break
         else:
             # 未命中字符 hitbox：先试最近 hitbox（行内空白区域），

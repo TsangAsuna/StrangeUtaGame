@@ -112,3 +112,18 @@ class TestSRTRoundtrip:
             "SRT 二次导出与第一次不同：\n"
             f"--- round1 ---\n{srt1}\n--- round2 ---\n{srt2}\n"
         )
+
+
+def test_utf8_bom_index_line_not_subtitle_text_E9():
+    """E9：带 BOM 的 SRT 首块序号行不再变成字幕文本。"""
+    content = (
+        "\ufeff1\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "あ\n"
+    )
+
+    lines = SRTParser().parse(content)
+
+    assert len(lines) == 1
+    assert lines[0].text == "あ"
+    assert lines[0].timetags == [(0, 1000)]

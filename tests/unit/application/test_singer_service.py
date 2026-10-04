@@ -318,3 +318,67 @@ class TestBatchSetEnabled:
         project = Project()
         service = SingerService(project)
         assert not service.batch_set_enabled(["nonexistent"], True)
+
+
+class TestAddSingerDisplayPriority:
+    """新加演唱者排到列表末尾（H5）。"""
+
+    def test_new_singer_appends_after_reorder(self):
+        """重排过一次后再新增：新演唱者应在末尾，而不是插到顶部"""
+        project = Project()
+        service = SingerService(project)
+        default = project.get_default_singer()
+        a = service.add_singer("A")
+        b = service.add_singer("B")
+
+        # 重排：B, A, default（display_priority 被重写为 0/1/2）
+        service.reorder_singers([b.id, a.id, default.id])
+
+        c = service.add_singer("C")
+        assert [s.name for s in project.singers] == ["B", "A", "未命名", "C"]
+        assert c.display_priority == len(project.singers) - 1
+
+    def test_priorities_ascending_for_sequential_adds(self):
+        project = Project()
+        service = SingerService(project)
+        service.add_singer("A")
+        service.add_singer("B")
+        service.add_singer("C")
+
+        priorities = [s.display_priority for s in project.singers]
+        assert priorities == sorted(priorities)
+
+
+class TestRemoveSingerDomainGuards:
+    """服务层与域层默认演唱者保护的对齐（C8）。"""
+
+    def test_single_remove_default_fails(self):
+        project = Project()
+        service = SingerService(project)
+        default = project.get_default_singer()
+        service.add_singer("A")
+
+        assert not service.remove_singer(default.id)
+        assert project.get_singer(default.id) is not None
+
+    def test_batch_remove_default_requires_receiver(self):
+        """删除默认演唱者且无有效接收者：拒绝，且不产生任何删除"""
+        project = Project()
+        service = SingerService(project)
+        default = project.get_default_singer()
+        a = service.add_singer("A")
+
+        assert not service.batch_remove_singers([default.id], None)
+        assert project.get_singer(default.id) is not None
+        assert project.get_singer(a.id) is not None
+
+    def test_batch_remove_default_reassigns_to_receiver_first(self):
+        """删除集合包含默认演唱者：先转移默认身份给接收者再删除"""
+        project = Project()
+        service = SingerService(project)
+        default = project.get_default_singer()
+        a = service.add_singer("A")
+
+        assert service.batch_remove_singers([default.id], a.id)
+        assert project.get_singer(default.id) is None
+        assert project.get_default_singer().id == a.id

@@ -36,17 +36,26 @@ class ASSParser(LyricParser):
     # ASS 时间戳格式: H:MM:SS.cc
     ASS_TIME_PATTERN = re.compile(r"(\d+):(\d{2}):(\d{2})\.(\d{2})")
 
-    # 卡拉OK标签: {\kf32}, {\k50}, {\ko10}, {\K30}, {\kF20}, {\kO15}
+    # ASS 覆盖块: {...}（不含嵌套花括号）。卡拉OK标签先按块扫描再在块内
+    # 找 \k 系 token（E3）：旧正则 `\{\\[kK][oOfF]?(\d+)\}` 要求 `}` 紧跟
+    # 数字，`{\kf32\b1}`、`{\ko25\c&H..&}` 这类复合块会整块匹配失败 →
+    # 时长被静默丢弃、后续拍整体提前。
+    ASS_BLOCK_PATTERN = re.compile(r"\{[^{}]*\}")
+    # 块内卡拉OK token: \k/\kf/\ko/\K/\kF/\kO + 时长（厘秒，支持小数）。
     # 注意：模式不能匹配 {\sing_...}（\sing 以 s 开头不是 [kK]）
-    KARAOKE_TAG_PATTERN = re.compile(r"\{\\[kK][oOfF]?(\d+)\}")
+    KARAOKE_TOKEN_PATTERN = re.compile(r"\\[kK][oOfF]?(\d+(?:\.\d+)?)")
 
     # SUG 私有 per-char singer 切换标记: {\sing_<name>}
     # name 允许中文/拉丁/数字/下划线/连字符，遇到 `}` 结束
     SING_TAG_PATTERN = re.compile(r"\{\\sing_([^}]*)\}")
 
-    # Dialogue 行（10 个字段）
+    # [Events] Format: 行（字段序声明，E6）
+    EVENT_FORMAT_PATTERN = re.compile(r"^Format\s*:\s*(.+)$")
+
+    # Dialogue 行默认字段序（ASS 10 字段）。SSA 的 `Marked=0` Layer 值
+    # 与显式 Format: 行的字段序由 _dialogue_pattern_for_fields 动态构建。
     DIALOGUE_PATTERN = re.compile(
-        r"^Dialogue:\s*\d+,"  # Layer
+        r"^Dialogue:\s*(?:Marked\s*=\s*\d+|\d+),"  # Layer / Marked
         r"([^,]+),"  # Start time
         r"([^,]+),"  # End time
         r"[^,]*,"  # Style
@@ -100,8 +109,15 @@ class ASSParser(LyricParser):
         self.has_karaoke_tags = False
         self.has_ruby_syntax = False
 
+        # 去除 UTF-8 BOM（E5）：BOM 使首行 "\ufeff[Script Info]" 的段头
+        # 识别失败，SUG 哨兵/PreRollMs 全部丢失
+        content = content.lstrip("\ufeff")
+
         lines: List[ParsedLine] = []
         section = ""  # 当前所在 section（小写）
+        # [Events] Format: 行声明字段序时动态构建的匹配器
+        # (pattern, start_group, end_group)；None = 用默认 DIALOGUE_PATTERN
+        dialogue_matcher: Optional[Tuple[re.Pattern, int, int]] = None
 
         for raw_line in content.split("\n"):
             raw_line = raw_line.rstrip("\r")
@@ -119,16 +135,33 @@ class ASSParser(LyricParser):
             if section != "[events]":
                 continue
 
-            if stripped.startswith("Format:") or stripped.startswith(";"):
+            if stripped.startswith(";"):
                 continue
 
-            match = self.DIALOGUE_PATTERN.match(stripped)
+            # Format: 行（E6）：按声明字段序构建 Dialogue 匹配，
+            # 不再无视字段顺序硬编码 ASS 10 字段
+            format_match = self.EVENT_FORMAT_PATTERN.match(stripped)
+            if format_match:
+                built = self._dialogue_pattern_for_fields(
+                    format_match.group(1).split(",")
+                )
+                if built is not None:
+                    dialogue_matcher = built
+                continue
+
+            if dialogue_matcher is not None:
+                match = dialogue_matcher[0].match(stripped)
+                start_group, end_group = dialogue_matcher[1], dialogue_matcher[2]
+            else:
+                match = self.DIALOGUE_PATTERN.match(stripped)
+                start_group, end_group = 1, 2
             if not match:
                 continue
 
-            start_time_str = match.group(1).strip()
-            end_time_str = match.group(2).strip()
-            text_field = match.group(3)
+            start_time_str = match.group(start_group).strip()
+            end_time_str = match.group(end_group).strip()
+            # Text 固定为最后一个捕获组（可能含逗号）
+            text_field = match.groups()[-1]
 
             start_ms = self._parse_ass_timestamp(start_time_str)
             if start_ms is None:
@@ -144,7 +177,8 @@ class ASSParser(LyricParser):
             if self._is_sug:
                 start_ms = max(0, start_ms + self._pre_roll_ms)
 
-            if self.KARAOKE_TAG_PATTERN.search(text_field):
+            karaoke_tags = self._find_karaoke_tags(text_field)
+            if karaoke_tags:
                 self.has_karaoke_tags = True
 
             parsed_line = self._parse_karaoke_text(text_field, start_ms, end_ms)
@@ -154,6 +188,63 @@ class ASSParser(LyricParser):
                 lines.append(parsed_line)
 
         return lines
+
+    @staticmethod
+    def _dialogue_pattern_for_fields(
+        fields: List[str],
+    ) -> Optional[Tuple[re.Pattern, int, int]]:
+        """按 [Events] Format: 行的字段序构建 Dialogue 匹配（E6）。
+
+        Returns:
+            (pattern, start_group, end_group)；Text 固定视为最后一个字段
+            （`(.*)`，可含逗号）。字段里找不到 Start/End 时返回 None
+            （畸形 Format: 行 → 回退默认匹配器）。
+        """
+        parts: List[str] = []
+        n_caps = 0  # 捕获组计数（Layer/Marked 等非捕获字段不占组号）
+        start_group = 0
+        end_group = 0
+        for idx, name in enumerate(fields):
+            key = name.strip().lower()
+            if idx == len(fields) - 1:
+                # 末字段按 Text 处理（可含逗号）
+                parts.append(r"(.*)")
+                n_caps += 1
+            elif key == "start":
+                n_caps += 1
+                start_group = n_caps
+                parts.append(r"([^,]+)")
+            elif key == "end":
+                n_caps += 1
+                end_group = n_caps
+                parts.append(r"([^,]+)")
+            elif key in ("layer", "marked"):
+                # ASS Layer 是纯数字；SSA 首字段叫 Marked、值形如 Marked=0
+                parts.append(r"(?:Marked\s*=\s*\d+|\d+)")
+            else:
+                parts.append(r"[^,]*")
+        if not start_group or not end_group:
+            return None
+        return (
+            re.compile(r"^Dialogue:\s*" + ",".join(parts) + r"$"),
+            start_group,
+            end_group,
+        )
+
+    @classmethod
+    def _find_karaoke_tags(cls, text: str) -> List[Tuple[int, int, str]]:
+        """按 {…} 覆盖块扫描卡拉OK标签（E3）。
+
+        Returns:
+            (块起点, 块终点, 时长厘秒字符串) 列表；每块取第一个 \\k 系
+            token。返回块的完整跨度，调用方据此切片段文本。
+        """
+        tags: List[Tuple[int, int, str]] = []
+        for block in cls.ASS_BLOCK_PATTERN.finditer(text):
+            token = cls.KARAOKE_TOKEN_PATTERN.search(block.group(0))
+            if token:
+                tags.append((block.start(), block.end(), token.group(1)))
+        return tags
 
     def _consume_script_info_line(self, line: str) -> None:
         """处理 [Script Info] 段的一行"""
@@ -266,7 +357,14 @@ class ASSParser(LyricParser):
         - 累加 duration → 下一片的起始时间。
         - 末尾片的 duration 不丢弃，作为 `line_end_ts`。
         """
-        karaoke_tags = list(self.KARAOKE_TAG_PATTERN.finditer(text))
+        # ASS 换行/硬空格语义（E8）：\N（硬换行）/\n（软换行）→ 换行字符、
+        # \h → 不换行空格。原本按字面 2 字符进入歌词，会占 char_idx 使
+        # 后续 ruby/timetag 映射错位。
+        text = (
+            text.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", "\u00a0")
+        )
+
+        karaoke_tags = self._find_karaoke_tags(text)
 
         if not karaoke_tags:
             clean_text = self._strip_non_karaoke_tags(text)
@@ -306,9 +404,9 @@ class ASSParser(LyricParser):
         last_timed_char_idx: Optional[int] = None
         current_singer: str = ""
 
-        for i, tag_match in enumerate(karaoke_tags):
-            duration_cs = int(tag_match.group(1))
-            duration_ms = duration_cs * 10
+        for i, (tag_start, tag_end, duration_str) in enumerate(karaoke_tags):
+            # 时长支持小数厘秒（如 \kf32.5）；毫秒取整保持 int 时间轴
+            duration_ms = int(round(float(duration_str) * 10))
             last_duration_ms = duration_ms
 
             # 推进 \sing_ 游标：任何位于本 \k 段之前（含同位置）的 \sing_
@@ -316,7 +414,7 @@ class ASSParser(LyricParser):
             # 注意：出现在「本段文本之后、下一段 \k 之前」的 \sing_ 属于下一段
             # 的切换（参考 SUG 导出契约：sing 标签插在新 singer 字符的 \k 段之前），
             # 由下一次迭代的 pre-loop 拾起，本段不消费。
-            seg_left_bound = tag_match.start()
+            seg_left_bound = tag_start
             while (
                 sing_iter_idx < len(sing_tags)
                 and sing_tags[sing_iter_idx].start() <= seg_left_bound
@@ -324,9 +422,9 @@ class ASSParser(LyricParser):
                 current_singer = sing_tags[sing_iter_idx].group(1).strip()
                 sing_iter_idx += 1
 
-            text_start = tag_match.end()
+            text_start = tag_end
             text_end = (
-                karaoke_tags[i + 1].start()
+                karaoke_tags[i + 1][0]
                 if i + 1 < len(karaoke_tags)
                 else len(text)
             )

@@ -6,6 +6,8 @@ FFmpeg 路径优先使用用户在「设置-关于/语言」中配置的路径�
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -94,16 +96,54 @@ def is_ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _extracted_cache_name(video_path: str) -> str:
+    """提取产物的稳定文件名：``{stem}_{内容指纹}.mp3``。
+
+    指纹取（规范化路径 + mtime_ns）的 sha1 前 12 位：
+    - 不同目录的同名视频指纹不同，不会再按 stem 互相覆盖串音；
+    - 同一路径重复提取得到同一文件名（覆盖写，不产生副本）；
+    - 文件内容被替换（mtime 变化）后指纹改变，不会复用过期音频。
+    """
+    p = Path(video_path)
+    try:
+        mtime_ns = p.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    try:
+        key = f"{p.resolve()}|{mtime_ns}"
+    except OSError:
+        key = f"{p}|{mtime_ns}"
+    # surrogatepass：Windows 路径可能含无法按严格 UTF-8 编码的字符
+    digest = hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"{p.stem}_{digest}.mp3"
+
+
 def clear_extracted_cache() -> None:
-    """清空 .cache/extracted/ 下的所有提取文件。"""
+    """清理提取管线的临时残留（``*.part-*`` 分片文件）。
+
+    注意：**不能**整目录清扫。提取产物会被 file_loader 存进项目当持久
+    音频，清掉其它视频的产物会破坏已保存的视频项目（数据丢失）。内容
+    指纹命名后产物稳定、无需清理；唯一要清的是 ffmpeg 写到一半（崩溃/
+    断电/超时被杀）残留的临时分片。
+    """
     cache_dir = _get_cache_dir()
-    if cache_dir.exists():
-        for f in cache_dir.glob("*"):
-            try:
-                if f.is_file():
-                    f.unlink()
-            except Exception:
-                pass
+    if not cache_dir.exists():
+        return
+    for f in cache_dir.glob("*.part-*"):
+        try:
+            if f.is_file():
+                f.unlink()
+        except Exception:
+            pass
+
+
+def _silent_unlink(path: Path) -> None:
+    """best-effort 删除文件（清理失败静默，不影响主流程）。"""
+    try:
+        if path.is_file():
+            path.unlink()
+    except Exception:
+        pass
 
 
 def extract_audio(video_path: str, progress_cb: Optional[LoadProgressCallback] = None) -> str:
@@ -135,22 +175,30 @@ def extract_audio(video_path: str, progress_cb: Optional[LoadProgressCallback] =
 
     clear_extracted_cache()
 
-    video_stem = Path(video_path).stem
     cache_dir = _get_cache_dir()
-    temp_path = str(cache_dir / f"{video_stem}.mp3")
+    # 产物名稳定（内容指纹），直接写最终名会在提取中途失败时留下同名的
+    # 截断 mp3 被后续当完整产物引用——先写临时分片，成功后原子改名。
+    final_path = cache_dir / _extracted_cache_name(video_path)
+    tmp_path = cache_dir / f"{final_path.name}.part-{os.getpid()}"
+    temp_path = str(final_path)
 
     if progress_cb:
         progress_cb("正在提取音频...", 0.1)
 
     ffmpeg = get_ffmpeg_path()
     cmd = [
-        ffmpeg, "-y",
+        ffmpeg,
+        # 损坏文件可能触发 ffmpeg 从 stdin 读交互指令而挂住至超时
+        "-nostdin",
+        "-y",
         "-i", video_path,
         "-vn",
         "-acodec", "libmp3lame",
         "-ab", f"{_MP3_QUALITY}k",
         "-ar", str(_TARGET_SAMPLE_RATE),
-        temp_path,
+        # 输出扩展名是 .part-*，ffmpeg 无法从扩展名推断容器，显式指定格式
+        "-f", "mp3",
+        str(tmp_path),
     ]
 
     # Windows 下隐藏控制台窗口，避免 GUI 应用调用 FFmpeg 时闪出黑框
@@ -164,8 +212,10 @@ def extract_audio(video_path: str, progress_cb: Optional[LoadProgressCallback] =
             creationflags=creation_flags,
         )
     except subprocess.TimeoutExpired:
+        _silent_unlink(tmp_path)
         raise RuntimeError("FFmpeg 提取超时（超过 10 分钟）")
     except FileNotFoundError:
+        _silent_unlink(tmp_path)
         if is_embedded():
             raise RuntimeError(
                 f"找不到 FFmpeg 可执行文件: {ffmpeg}。嵌入式运行的 FFmpeg 由工作台统一管理，"
@@ -177,10 +227,16 @@ def extract_audio(video_path: str, progress_cb: Optional[LoadProgressCallback] =
 
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace")
+        _silent_unlink(tmp_path)
         raise RuntimeError(f"FFmpeg 提取失败:\n{stderr[-800:]}")
 
-    if not Path(temp_path).is_file():
+    if not tmp_path.is_file():
         raise RuntimeError("FFmpeg 未生成输出文件，请确认视频文件包含音频流。")
+
+    try:
+        os.replace(str(tmp_path), str(final_path))
+    except OSError as exc:
+        raise RuntimeError(f"提取音频写入缓存失败: {exc}") from exc
 
     if progress_cb:
         progress_cb("音频提取完成", 1.0)

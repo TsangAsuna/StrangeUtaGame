@@ -675,6 +675,9 @@ def _download_verified(
                         )
         except AiRuntimeError as exc:
             if str(exc) == "已取消":
+                # .part 每个源全新写入、无断点复用价值：取消即清，
+                # 否则 staging 残留最多 ~3.2GB 死重并干扰磁盘预检
+                part.unlink(missing_ok=True)
                 raise
             errors.append(f"{cand_url}: {exc}")
             continue
@@ -690,6 +693,9 @@ def _download_verified(
         part.replace(dest)
         return
 
+    # 所有下载源都失败：清掉无效 .part（校验通过的完整分卷仍留在
+    # staging 供重试复用），再向上抛中文错误
+    part.unlink(missing_ok=True)
     raise AiRuntimeError(
         f"下载失败（{label or url}），已尝试 {len(attempts)} 个下载源："
         + "；".join(errors[-3:])
@@ -1280,7 +1286,16 @@ class AiRuntimeManager:
                     joined.write(part.read_bytes())
                 joined.seek(0)
                 with zipfile.ZipFile(joined) as zf:
-                    zf.extractall(payload)
+                    # 逐成员经 _safe_extract_path 校验后再解压（zip-slip
+                    # 防护）：下载链含第三方镜像，恶意 zip 的 ../ 或绝对
+                    # 路径条目可逃逸 payload 目录任意写文件
+                    for member in zf.infolist():
+                        target = _safe_extract_path(payload, member.filename)
+                        if target is None:
+                            raise AiRuntimeError(
+                                f"运行环境底座包含非法路径条目：{member.filename}"
+                            )
+                        zf.extract(member, payload)
         except Exception as exc:
             raise AiRuntimeError(f"解压运行环境失败：{exc}") from exc
 
@@ -1350,8 +1365,9 @@ class AiRuntimeManager:
             cancel=cancel,
             log=log,
         )
-        # 成功后清理 staging（底座分卷 + torch wheel 共约 3.2GB）；
-        # 失败路径保留，供重试时断点复用
+        # 成功后清理 staging（底座分卷 + torch wheel 共约 3.2GB）。
+        # 失败路径保留 staging：重试可复用校验通过的完整分卷；无效
+        # .part 已由 _download_verified 在取消/失败时清掉，不再积累
         import shutil as _shutil
 
         _shutil.rmtree(staging, ignore_errors=True)

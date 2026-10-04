@@ -8,6 +8,7 @@
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -984,3 +985,80 @@ class TestFrozenPackageRoot:
         assert AlignmentWorkerClient._package_root() == Path(
             _sys.executable
         ).resolve().parent
+
+
+class TestClientLifecycleHygiene:
+    """G5/G10：stderr 临时文件回收与启动窗口期取消不丢失。"""
+
+    def test_close_removes_stderr_temp_file(self, tmp_path):
+        """close() 必须删除 stderr 临时文件（此前 %TEMP% 无限累积）。"""
+        request = _fake_request()
+        with AlignmentWorkerClient() as client:
+            client.run(
+                request,
+                audio_path=str(tmp_path / "v.wav"),
+                model_spec=_FAKE_MODEL,
+            )
+            stderr_name = getattr(client, "_stderr_file", None)
+            assert stderr_name is not None, "启动后应持有 stderr 临时文件"
+            stderr_path = Path(stderr_name.name)
+            assert stderr_path.is_file()
+        # with 退出 = close()：临时文件随句柄一并删除
+        assert not stderr_path.exists()
+
+    def test_ensure_started_discards_stale_stderr_file(self, tmp_path):
+        """重启前先回收上一轮 stderr 临时文件（覆盖式打开曾令旧句柄
+        永久泄漏在 %TEMP%）。"""
+        client = AlignmentWorkerClient()
+        try:
+            client._python_exe = "definitely-missing-python.exe"
+            with pytest.raises(AlignmentWorkerError):
+                client._ensure_started()
+            # 失败路径同样不残留旧文件
+            assert getattr(client, "_stderr_file", None) is None
+
+            # 预置一个"旧"临时文件句柄，再次启动应先被清理
+            import tempfile as _tf
+
+            stale = open(
+                _tf.NamedTemporaryFile(prefix="krok-aitiming-stderr-", delete=False).name,
+                "w",
+                encoding="utf-8",
+            )
+            stale_path = Path(stale.name)
+            client._stderr_file = stale
+            client._python_exe = "definitely-missing-python.exe"
+            with pytest.raises(AlignmentWorkerError):
+                client._ensure_started()
+            assert not stale_path.exists()
+        finally:
+            client.close()
+
+    def test_cancel_before_start_still_cancels(self, tmp_path):
+        """G10：启动窗口期的 cancel()（proc 尚为 None）不能被
+        _ensure_started 的 clear 吞掉——任务须以「已取消」收场而非
+        悄悄跑完。"""
+        request = _fake_request(n_tokens=50, fake_duration_ms=5000, fake_delay_ms=60)
+        client = AlignmentWorkerClient()
+        client.cancel()  # 进程未启动时请求取消
+        outcomes = {}
+
+        def _run():
+            try:
+                client.run(
+                    request,
+                    audio_path=str(tmp_path / "v.wav"),
+                    model_spec=_FAKE_MODEL,
+                )
+                outcomes["status"] = "done"
+            except AlignmentWorkerCancelled:
+                outcomes["status"] = "cancelled"
+            except Exception as exc:  # noqa: BLE001
+                outcomes["status"] = f"error: {exc}"
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join(timeout=20)
+        client.close()
+
+        assert outcomes.get("status") == "cancelled"

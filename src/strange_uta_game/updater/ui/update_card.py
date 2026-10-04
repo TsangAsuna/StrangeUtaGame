@@ -433,6 +433,13 @@ def _show_update_dialog(parent: "SettingsInterface", result: CheckResult) -> Non
         proxy_url=proxy_url,
         locale=_get_current_locale(),
     )
+    # 预取主包 .sha256 透传给 Updater（--sha256）；拉取失败置空，
+    # Updater 侧会再次尝试并在仍拿不到时拒绝安装（fail-closed）。
+    plan.expected_sha256 = _installer.fetch_asset_sha256(
+        result.primary_asset_name,
+        list(result.download_candidates),
+        proxy_url,
+    )
 
     # 弹出进度窗口，在后台线程完成"自更新 Updater + 启动"
     # （_update_updater_from_remote 有网络请求，同步调用会冻结 UI 数秒）

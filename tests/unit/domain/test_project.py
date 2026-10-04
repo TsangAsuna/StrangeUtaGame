@@ -220,3 +220,144 @@ class TestProject:
         assert chars[1].timestamps == []
         assert chars[1].is_line_end is False
         assert chars[1].is_sentence_end is False
+
+
+class TestShiftSelectedCheckpointTailCp:
+    """shift_selected_checkpoint_if_lost 承认句尾停顿点 cp（C4）。"""
+
+    def _project_with_sentence_end_char(self):
+        project = Project()
+        singer = project.get_default_singer()
+        sentence = Sentence(
+            singer_id=singer.id,
+            characters=[
+                Character(char="空", check_count=1, singer_id=singer.id,
+                          is_sentence_end=True),
+            ],
+        )
+        project.add_sentence(sentence)
+        return project, sentence
+
+    def test_tail_cp_is_still_valid(self):
+        """选中句尾停顿点 cp（cp_idx == check_count）不应被顺延"""
+        project, sentence = self._project_with_sentence_end_char()
+        project.set_selected_checkpoint(0, 0, 1)  # tail cp = check_count
+
+        assert project.shift_selected_checkpoint_if_lost() is False
+        assert project.get_selected_checkpoint() == (0, 0, 1)
+
+    def test_tail_cp_valid_with_zero_check_count(self):
+        """check_count=0 的停顿点字符：cp 0 即停顿点 cp，仍有效"""
+        project, sentence = self._project_with_sentence_end_char()
+        sentence.characters[0].check_count = 0
+        project.set_selected_checkpoint(0, 0, 0)
+
+        assert project.shift_selected_checkpoint_if_lost() is False
+        assert project.get_selected_checkpoint() == (0, 0, 0)
+
+    def test_stale_cp_beyond_tail_still_shifts(self):
+        """真正的越界 cp（非停顿点字符的 cp_idx == check_count）仍需顺延"""
+        project = Project()
+        singer = project.get_default_singer()
+        sentence = Sentence(
+            singer_id=singer.id,
+            characters=[Character(char="あ", check_count=1, singer_id=singer.id)],
+        )
+        project.add_sentence(sentence)
+        project.set_selected_checkpoint(0, 0, 1)  # check_count=1，cp1 无效
+
+        assert project.shift_selected_checkpoint_if_lost() is True
+        assert project.get_selected_checkpoint() == (0, 0, 0)
+
+
+class TestRemoveSingerGuards:
+    """remove_singer 的默认演唱者保护与自转移拒绝（C8）。"""
+
+    def test_reject_self_transfer(self):
+        project = Project()
+        singer = Singer(name="和声")
+        project.add_singer(singer)
+
+        with pytest.raises(ValidationError, match="自身"):
+            project.remove_singer(singer.id, transfer_to=singer.id)
+
+    def test_reject_removing_last_default(self):
+        """删除默认演唱者后项目将失去默认：拒绝"""
+        project = Project()
+        default = project.get_default_singer()
+        project.add_singer(Singer(name="和声"))  # 非默认
+
+        with pytest.raises(ValidationError, match="默认演唱者"):
+            project.remove_singer(default.id)
+
+    def test_allow_removing_default_after_reassign(self):
+        """先把其他演唱者设为默认再删除：允许（导入预设流程的先设后删）"""
+        project = Project()
+        default = project.get_default_singer()
+        singer = Singer(name="和声")
+        project.add_singer(singer)
+        # 模拟 singer_interface 导入预设流程：先设新默认，再删旧默认占位符
+        for s in project.singers:
+            s.is_default = s.id == singer.id
+
+        project.remove_singer(default.id, transfer_to=singer.id)
+
+        assert project.get_singer(default.id) is None
+        assert project.get_default_singer().id == singer.id
+
+
+class TestSentenceOrderApis:
+    """add_sentence 参考句校验与 move_sentence 槽位语义（C9）。"""
+
+    def test_add_sentence_missing_reference_raises(self):
+        project = Project()
+        singer = project.get_default_singer()
+        s = Sentence.from_text("测试", singer.id)
+
+        with pytest.raises(DomainError, match="参考句子"):
+            project.add_sentence(s, after_sentence_id="nonexistent")
+        # 抛错时不产生静默追加
+        assert len(project.sentences) == 0
+
+    def test_add_sentence_valid_reference_inserts_after(self):
+        project = Project()
+        singer = project.get_default_singer()
+        s1 = Sentence.from_text("1", singer.id)
+        s2 = Sentence.from_text("2", singer.id)
+        project.add_sentence(s1)
+        project.add_sentence(s2, after_sentence_id=s1.id)
+
+        assert [s.text for s in project.sentences] == ["1", "2"]
+
+    def test_move_sentence_backward_takes_target_slot(self):
+        project = Project()
+        singer = project.get_default_singer()
+        for text in ("1", "2", "3"):
+            project.add_sentence(Sentence.from_text(text, singer.id))
+
+        project.move_sentence(project.sentences[2].id, 0)
+
+        assert [s.text for s in project.sentences] == ["3", "1", "2"]
+
+    def test_move_sentence_forward_takes_target_slot(self):
+        """向前移动落到目标槽位（被目标位原句让位），不再偏移一位"""
+        project = Project()
+        singer = project.get_default_singer()
+        for text in ("1", "2", "3", "4"):
+            project.add_sentence(Sentence.from_text(text, singer.id))
+
+        project.move_sentence(project.sentences[0].id, 2)
+
+        assert [s.text for s in project.sentences] == ["2", "1", "3", "4"]
+
+    def test_move_sentence_to_same_position_is_noop(self):
+        project = Project()
+        singer = project.get_default_singer()
+        s1 = Sentence.from_text("1", singer.id)
+        s2 = Sentence.from_text("2", singer.id)
+        project.add_sentence(s1)
+        project.add_sentence(s2)
+
+        project.move_sentence(s1.id, 0)
+
+        assert [s.text for s in project.sentences] == ["1", "2"]

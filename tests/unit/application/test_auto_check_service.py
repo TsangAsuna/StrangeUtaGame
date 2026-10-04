@@ -90,12 +90,20 @@ class TestMergeNRubyParts:
 
 
 def _get_sudachi_analyzer():
-    """获取跨平台的真实注音分析器。"""
+    """获取跨平台的真实注音分析器。
+
+    sudachipy / sudachidict_small 是 noWinIME / mac 变体的可选依赖
+    （requirements-variants.txt），主变体环境未安装时跳过用例，
+    而不是以 ImportError 失败。
+    """
     from strange_uta_game.backend.infrastructure.parsers.ruby_analyzer import (
         SudachiAnalyzer,
     )
 
-    return SudachiAnalyzer()
+    try:
+        return SudachiAnalyzer()
+    except ImportError as exc:
+        pytest.skip(f"sudachi 分析器不可用，跳过：{exc}")
 
 
 class TestAutoCheckService:
@@ -482,6 +490,11 @@ class TestSelectedCheckpointShift:
         project.sentences.append(sentence)
         project.set_selected_checkpoint(0, 0, 0)
         sentence.characters[0].check_count = 0
+        # 开关关闭的真实流程（apply_to_sentence）会一并重算 is_sentence_end；
+        # 单字行 from_text 会把「、」标成句尾停顿点，若保留该标记则 cp 0 是
+        # 仍有效的停顿点虚拟 cp（见 TestShiftSelectedCheckpointTailCp），
+        # 不构成"全部失效"。
+        sentence.characters[0].is_sentence_end = False
         project.shift_selected_checkpoint_if_lost()
         assert project.get_selected_checkpoint() is None
 

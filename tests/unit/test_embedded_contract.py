@@ -223,7 +223,10 @@ class TestEmbeddedUIContract:
     def test_hidden_in_embedded(self, qapp):
         about = self._make_about(qapp)
         embedded_settings = SimpleNamespace(
-            _provider=object(), _config_path=None, get=lambda k, d=None: d
+            _provider=object(),
+            _config_path=None,
+            config_paths=SimpleNamespace(config=None),
+            get=lambda k, d=None: d,
         )
         about.load_settings(embedded_settings)
         assert about._path_card.isHidden()
@@ -236,6 +239,7 @@ class TestEmbeddedUIContract:
         standalone_settings = SimpleNamespace(
             _provider=None,
             _config_path=Path("C:/x/config.json"),
+            config_paths=SimpleNamespace(config=Path("C:/x/config.json")),
             get=lambda k, d=None: d,
         )
         about.load_settings(standalone_settings)
@@ -273,9 +277,14 @@ class TestEmbeddedUIContract:
     def test_dead_buttons_no_crash_in_embedded(self, qapp):
         about = self._make_about(qapp)
         about.load_settings(
-            SimpleNamespace(_provider=object(), _config_path=None, get=lambda k, d=None: d)
+            SimpleNamespace(
+                _provider=object(),
+                _config_path=None,
+                config_paths=SimpleNamespace(config=None),
+                get=lambda k, d=None: d,
+            )
         )
-        # _config_path is None -> 必须早返回，不能 None.parent 崩
+        # config_paths.config is None -> 必须早返回，不能 None.parent 崩
         about._open_config_dir()
         about._change_config_dir()
 

@@ -549,3 +549,134 @@ class TestASSRoundtrip:
         assert c_space.global_timestamps == [35010], (
             f"空格应承接轴点间隙 (ts 35010): {c_space.global_timestamps}"
         )
+
+
+# ──────────────────────────────────────────────
+# E3 / E5 / E6 / E8 回归
+# ──────────────────────────────────────────────
+
+_EVENTS = "[Events]\n"
+_DEFAULT_FORMAT = (
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+    "Effect, Text\n"
+)
+
+
+def _parse_lines(content: str):
+    return ASSParser().parse(content)
+
+
+class TestCompositeKaraokeBlockE3:
+    """E3：卡拉OK标签按 {…} 块扫描，复合块/小数时长不再丢拍。"""
+
+    def test_composite_block_with_other_tags(self):
+        lines = _parse_lines(
+            _EVENTS + _DEFAULT_FORMAT
+            + r"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\kf32\b1}あ{\ko25\c&H000000&}い"
+            + "\n"
+        )
+
+        assert len(lines) == 1
+        assert lines[0].text == "あい"
+        # \kf32=320ms → い @ 1000+320=1320
+        assert lines[0].timetags == [(0, 1000), (1, 1320)]
+
+    def test_decimal_duration(self):
+        lines = _parse_lines(
+            _EVENTS + _DEFAULT_FORMAT
+            + r"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\k50}あ{\kf12.5}い"
+            + "\n"
+        )
+
+        assert lines[0].timetags == [(0, 1000), (1, 1500)]
+
+    def test_has_karaoke_tags_detected_for_composite_block(self):
+        parser = ASSParser()
+        parser.parse(
+            _EVENTS + _DEFAULT_FORMAT
+            + r"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\kf32\b1}あ"
+            + "\n"
+        )
+        assert parser.has_karaoke_tags is True
+
+
+class TestAssBomE5:
+    """E5：UTF-8 BOM 不再破坏 [Script Info] 段头识别（SUG 哨兵丢失）。"""
+
+    def test_bom_script_info_sentinel_detected(self):
+        parser = ASSParser()
+        lines = parser.parse(
+            "﻿[Script Info]\n"
+            "; Generator: StrangeUtaGame\n"
+            "; SUG-PreRollMs: 500\n"
+            "\n"
+            "[Events]\n"
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,あ\n"
+        )
+
+        assert parser._is_sug is True
+        assert parser._pre_roll_ms == 500
+        # SUG 哨兵：首字 ts = Dialogue Start + pre_roll
+        assert lines[0].timetags == [(0, 1500)]
+
+
+class TestSSADialogueE6:
+    """E6：SSA Marked=0 与自定义 Format: 字段序。"""
+
+    def test_ssa_marked_zero_parsed(self):
+        lines = _parse_lines(
+            _EVENTS
+            + "Format: Marked, Start, End, Style, Name, MarginL, MarginR, "
+              "MarginV, Effect, Text\n"
+            + "Dialogue: Marked=0,0:00:01.00,0:00:03.00,Default,,0,0,0,,SSA行\n"
+        )
+
+        assert [l.text for l in lines] == ["SSA行"]
+        assert lines[0].timetags == [(0, 1000)]
+        assert lines[0].line_end_ts == 3000
+
+    def test_marked_zero_without_format_line(self):
+        lines = _parse_lines(
+            _EVENTS
+            + "Dialogue: Marked=0,0:00:01.00,0:00:03.00,Default,,0,0,0,,無Format\n"
+        )
+
+        assert [l.text for l in lines] == ["無Format"]
+        assert lines[0].timetags == [(0, 1000)]
+
+    def test_shuffled_format_field_order(self):
+        lines = _parse_lines(
+            _EVENTS
+            + "Format: Name, Start, Style, End, MarginL, MarginR, MarginV, "
+              "Effect, Layer, Text\n"
+            + "Dialogue: N1,0:00:01.00,Def,0:00:03.00,0,0,0,,0,乱序\n"
+        )
+
+        assert [l.text for l in lines] == ["乱序"]
+        assert lines[0].timetags == [(0, 1000)]
+        assert lines[0].line_end_ts == 3000
+
+
+class TestAssLineBreakCharsE8:
+    """E8：Dialogue 文本中的换行标签转为换行/空格语义，不占字面 char_idx。"""
+
+    def test_hard_break_and_hard_space(self):
+        lines = _parse_lines(
+            _EVENTS + _DEFAULT_FORMAT
+            + r"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\k50}あ\N{\k50}い\hう"
+            + "\n"
+        )
+
+        assert lines[0].text == "あ\nい う"
+        # \N 之前 1 个字符；\N 本身不占字面 2 字符的 char_idx
+        assert lines[0].timetags == [(0, 1000), (2, 1500)]
+
+    def test_second_line_ts_index_follows_converted_text(self):
+        lines = _parse_lines(
+            _EVENTS + _DEFAULT_FORMAT
+            + r"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\k50}あ\N{\k50}う"
+            + "\n"
+        )
+
+        # う 是 \N 转换后的换行符之后第 1 个字符 → char_idx 2（而非 3）
+        assert lines[0].timetags == [(0, 1000), (2, 1500)]

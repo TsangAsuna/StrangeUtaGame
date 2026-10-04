@@ -483,8 +483,10 @@ class BulkChangeDialog(QDialog):
         word = self.edit_word.text().strip()
         if not word:
             return
-        new_text = self.edit_new_chars.text().strip()
-        if not new_text:
+        # 搜索词仅用于匹配，可 strip；替换文本写回保留原文：
+        # .strip() 会吞掉有义空格，且把同长度原地改误判成换长度
+        new_text = self.edit_new_chars.text()
+        if not new_text.strip():
             return
 
         per_char_ruby, per_char_check, per_char_linked_req = self._collect_per_char(
