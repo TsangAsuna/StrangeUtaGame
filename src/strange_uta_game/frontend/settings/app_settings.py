@@ -22,12 +22,34 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Optional, Protocol, runtime_checkable
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    NamedTuple,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 import json
+import os
 import sys
 import threading
 
 from strange_uta_game import app_dirs
+
+
+class ConfigPaths(NamedTuple):
+    """AppSettings 各存储文件路径的只读快照（standalone 文件模式）。
+
+    embedded / provider 模式下各字段为 ``None``。供 UI 层展示与迁移使用，
+    替代直接访问 ``_config_path`` 等私有属性。
+    """
+
+    config: Optional[Path]
+    dictionary: Optional[Path]
+    network_dictionary: Optional[Path]
+    singers: Optional[Path]
 
 
 @runtime_checkable
@@ -293,6 +315,9 @@ class AppSettings:
             # 保存未命名（untitled）项目时优先使用的目录；留空则回退到
             # 已保存项目 / 最近加载目录。见 ProjectStore.save_dir。
             "default_save_dir": "",
+            # 历史遗留的 .temp 目录（更改配置位置后未迁移成功的旧位置），
+            # 供闪退恢复扫描兜底；由 about._change_config_dir 写入。
+            "legacy_temp_dirs": [],
         },
         "tools": {
             "ffmpeg_path": "",
@@ -534,6 +559,45 @@ class AppSettings:
         目录不可写时回退到 ``~/.strange_uta_game``。
         """
         return app_dirs.config_dir()
+
+    @property
+    def config_paths(self) -> ConfigPaths:
+        """各存储文件路径的只读视图（embedded / provider 模式全为 None）。
+
+        供 UI 层展示与迁移使用，替代直接访问 ``_config_path`` 等私有属性。
+        """
+        return ConfigPaths(
+            config=self._config_path,
+            dictionary=self._dict_path,
+            network_dictionary=self._network_dict_path,
+            singers=self._singers_path,
+        )
+
+    def retarget_config_dir(self, new_dir: Path) -> None:
+        """把本实例的存储目标原地切换到 ``new_dir``（standalone 专用）。
+
+        「更改配置位置」使用：调用方先写好 ``.config_redirect`` 标记并复制
+        配置文件，再调用本方法改写四个存储路径，并把进程级共享实例缓存的
+        key 同步迁移到新位置 —— 保证之后 ``AppSettings()`` 仍命中**同一个**
+        实例（新 key 与 ``__new__`` 按新 ``config_dir()`` 计算的 key 一致），
+        避免新旧两个共享实例内存态分裂、互相覆盖。
+        """
+        new_dir = Path(new_dir)
+        self._config_path = new_dir / "config.json"
+        self._dict_path = new_dir / "dictionary.json"
+        self._network_dict_path = new_dir / "network_dictionary.json"
+        self._singers_path = new_dir / "singers.json"
+        # 把缓存中本实例的条目迁移到新 key（保留原 provider 引用语义）
+        cls = type(self)
+        pinned_provider = cls._default_provider
+        for key, (_pinned, instance) in list(cls._shared_instances.items()):
+            if instance is self:
+                pinned_provider = _pinned
+                del cls._shared_instances[key]
+        cls._shared_instances[("file", str(self._config_path))] = (
+            pinned_provider,
+            self,
+        )
 
     @staticmethod
     def _get_packaged_config_path(filename: str) -> Optional[Path]:
@@ -807,6 +871,11 @@ class AppSettings:
                 # 以默认值为基础，用户配置覆盖
                 self._migrate_display_heights(loaded)
                 self._deep_merge(defaults, loaded)
+            except json.JSONDecodeError as e:
+                # 半截 JSON（常见于上次写盘被硬退/杀进程打断）：改名留档
+                # 便于用户找回 API Key 等内容，本次用默认值重建。
+                print(f"设置文件损坏（JSON 解析失败）: {e}")
+                self._archive_corrupt_config()
             except Exception as e:
                 print(f"加载设置失败: {e}")
         else:
@@ -821,6 +890,25 @@ class AppSettings:
                     pass
 
         return defaults
+
+    def _archive_corrupt_config(self) -> None:
+        """把损坏的 config.json 改名为 ``config.json.corrupt-<时间戳>`` 留档。
+
+        半截 JSON 多由非原子写盘被硬退 / 杀进程打断造成；留档便于用户手工
+        找回内容，同时避免下次启动再读到同一份坏文件静默重置全部设置。
+        """
+        try:
+            from datetime import datetime
+
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = self._config_path.with_name(
+                f"{self._config_path.name}.corrupt-{ts}"
+            )
+            with type(self)._io_lock:
+                self._config_path.rename(target)
+            print(f"已留档损坏的配置文件: {target}")
+        except Exception as e:
+            print(f"留档损坏配置文件失败: {e}")
 
     def _load_packaged_defaults(self) -> Dict[str, Any]:
         """从内嵌 config.json 加载默认配置"""
@@ -857,24 +945,29 @@ class AppSettings:
     def save(self) -> None:
         """持久化当前设置。
 
-        Provider 模式委托给 ``provider.save``；standalone 模式写
-        ``config.json``。两条路径都吞异常并打印日志，不抛。
+        Provider 模式委托给 ``provider.save``；standalone 模式原子写
+        ``config.json``（tmp + os.replace）。两条路径都吞异常并打印日志，不抛。
         """
         if self._provider is not None:
             try:
                 save_partial = getattr(self._provider, "save_partial", None)
                 if self._dirty_paths and callable(save_partial):
-                    save_partial(
-                        {
+                    with type(self)._io_lock:
+                        # 持锁快照：与并发 set() 的嵌套字典修改互斥，
+                        # 避免 deepcopy 迭代中字典变化抛 RuntimeError。
+                        payload = {
                             path: deepcopy(self.get(path))
                             for path in sorted(self._dirty_paths)
                         }
-                    )
+                    save_partial(payload)
                     self._dirty_paths.clear()
                     return
                 # deepcopy 出去：provider 应能持有完全独立的副本，避免
                 # 后续 AppSettings.set 改写到 provider 内部状态。
-                self._provider.save(deepcopy(self._settings))
+                # 同样持锁快照（同上，防止与并发 set() 竞态）。
+                with type(self)._io_lock:
+                    payload = deepcopy(self._settings)
+                self._provider.save(payload)
                 self._dirty_paths.clear()
             except Exception as e:
                 print(f"保存设置失败 (provider): {e}")
@@ -883,8 +976,18 @@ class AppSettings:
             # 文件级锁：网络词典自动更新等 daemon 线程与 UI 线程并发写
             # config.json 时避免 open(w) 竞争（Windows 下会 PermissionError）。
             with type(self)._io_lock:
-                with open(self._config_path, "w", encoding="utf-8") as f:
-                    json.dump(self._settings, f, indent=2, ensure_ascii=False)
+                # 先持锁 deepcopy 快照再序列化：set() 可能在其他线程无锁
+                # 修改嵌套 dict，json.dump 迭代过程中字典变化会抛
+                # RuntimeError 被吞（该轮设置丢失）。快照后 dump 不再受
+                # 后续 set() 影响。
+                payload = deepcopy(self._settings)
+                # temp + os.replace 原子替换：任何时刻磁盘上的 config.json
+                # 要么是旧的完整内容，要么是新的完整内容，绝不出现半截文件
+                # （此前 open(w)+dump 被硬退打断会静默丢失全部设置）。
+                tmp_path = self._config_path.with_name(self._config_path.name + ".tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                os.replace(str(tmp_path), str(self._config_path))
             self._dirty_paths.clear()
         except Exception as e:
             print(f"保存设置失败: {e}")
@@ -921,12 +1024,17 @@ class AppSettings:
 
     def set(self, path: str, value: Any) -> None:
         keys = path.split(".")
-        target = self._settings
-        for key in keys[:-1]:
-            if key not in target:
-                target[key] = {}
-            target = target[key]
-        target[keys[-1]] = value
+        # _io_lock：本方法可能在 daemon 线程（网络词典自动更新等）被调，
+        # 与另一线程 save() 持锁进行的 json.dump / deepcopy 迭代并发——
+        # 无锁修改嵌套字典会让迭代抛 RuntimeError 被吞（该轮设置丢失）。
+        # RLock 可重入，同线程 save() 内再取锁不冲突。
+        with type(self)._io_lock:
+            target = self._settings
+            for key in keys[:-1]:
+                if key not in target:
+                    target[key] = {}
+                target = target[key]
+            target[keys[-1]] = value
         # dirty 标记供两条路径消费：provider 模式的 save_partial 增量写、
         # reset_shared_instances 丢弃实例前的 flush。
         self._dirty_paths.add(path)
@@ -957,10 +1065,12 @@ class AppSettings:
 
     @staticmethod
     def _save_json(path: Path, data: Any) -> None:
-        """写入 JSON 文件。"""
+        """写入 JSON 文件（tmp + os.replace 原子替换，避免留半截文件）。"""
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            tmp_path = path.with_name(path.name + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(str(tmp_path), str(path))
         except Exception as e:
             print(f"保存文件失败 {path}: {e}")
 

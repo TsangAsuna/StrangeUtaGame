@@ -26,6 +26,23 @@ from strange_uta_game.frontend.settings.settings_interface import AppSettings
 FMT_NICOKARA_RUBY = "Nicokara (带注音)"
 
 
+def _drain_export(page, qapp, timeout_s: float = 30.0) -> None:
+    """等待后台导出线程完成并处理完回城信号（导出已移入 QThread）。"""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while getattr(page, "_exporting", False) and time.monotonic() < deadline:
+        qapp.processEvents()
+        thread = getattr(page, "_export_thread", None)
+        if thread is not None:
+            thread.wait(50)
+    qapp.processEvents()
+    thread = getattr(page, "_export_thread", None)
+    if thread is not None:
+        thread.wait(5000)
+    assert getattr(page, "_exporting", False) is False, "导出线程超时未完成"
+
+
 @pytest.fixture(autouse=True)
 def _restore_nicokara_tags():
     """本文件会改写 AppSettings 的 nicokara_tags；会话级隔离目录不隔离
@@ -106,6 +123,7 @@ class TestAxisGroupStandaloneExport:
         )
 
         page._on_export()
+        _drain_export(page, qapp)
 
         f1 = tmp_path / "song_轴1.lrc"
         f2 = tmp_path / "song_轴2.lrc"
@@ -134,6 +152,7 @@ class TestAxisGroupStandaloneExport:
         project.set_axis_groups([AxisGroup(name="轴1", singer_ids=[a])])
 
         page._on_export()
+        _drain_export(page, qapp)
 
         f1 = tmp_path / "song.lrc"
         assert f1.is_file()
@@ -147,6 +166,7 @@ class TestAxisGroupStandaloneExport:
         page, project, _ids = _make_page(qapp, tmp_path)
 
         page._on_export()
+        _drain_export(page, qapp)
 
         f = tmp_path / "song.lrc"
         assert f.is_file()
@@ -176,6 +196,7 @@ class TestAxisGroupStandaloneExport:
         )
 
         page._on_export()
+        _drain_export(page, qapp)
 
         assert len(prompts) == 1, "覆盖确认应合并为一次弹出"
         # 两个文件名都在同一次提示里
@@ -207,6 +228,7 @@ class TestAxisGroupStandaloneExport:
         )
 
         page._on_export()
+        _drain_export(page, qapp)
 
         assert len(prompts) == 1
         assert (tmp_path / "song_轴1.lrc").read_text(encoding="utf-8") == "OLD"
@@ -223,6 +245,7 @@ class TestAxisGroupStandaloneExport:
         )
 
         page._on_export()
+        _drain_export(page, qapp)
 
         f1 = tmp_path / "song_轴1.lrc"
         f2 = tmp_path / "song_轴2.lrc"
@@ -251,9 +274,61 @@ class TestAxisGroupStandaloneExport:
                 break
 
         page._on_export()
+        _drain_export(page, qapp)
 
         files = sorted(p.name for p in tmp_path.glob("song*.lrc"))
         assert files == ["song.lrc"]
+
+    def test_duplicate_sanitized_group_filenames_abort_export(self, qapp, tmp_path):
+        """不同分组名 sanitize 后撞名 → 导出前中止，不写任何文件（H10）。"""
+        page, project, (a, b) = _make_page(qapp, tmp_path)
+        project.set_axis_groups(
+            [
+                AxisGroup(name="A/B", singer_ids=[a]),  # sanitize → A_B
+                AxisGroup(name="A_B", singer_ids=[b]),  # 撞名
+            ]
+        )
+
+        page._on_export()
+        _drain_export(page, qapp)
+
+        assert page._exporting is False
+        assert list(tmp_path.glob("*.lrc")) == [], "撞名应整体中止，不落任何文件"
+
+    def test_failed_job_cleans_tmp_and_rest_continue(self, qapp, tmp_path, monkeypatch):
+        """单任务失败：.tmp 被清理、正式目标不残留，其余任务继续（H3）。"""
+        from strange_uta_game.backend.application.export_service import ExportResult
+
+        page, project, (a, b) = _make_page(qapp, tmp_path)
+        project.set_axis_groups(
+            [
+                AxisGroup(name="轴1", singer_ids=[a]),
+                AxisGroup(name="轴2", singer_ids=[b]),
+            ]
+        )
+
+        service = page._export_service
+        real_export = service.export
+        state = {"n": 0}
+
+        def fake_export(project_, format_name, file_path, **kwargs):
+            state["n"] += 1
+            if state["n"] == 1:
+                # 模拟导出器写一半后失败：留下 .tmp 且不产生正式文件
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write("PARTIAL")
+                return ExportResult(success=False, error_message="boom")
+            return real_export(project_, format_name, file_path, **kwargs)
+
+        monkeypatch.setattr(service, "export", fake_export)
+
+        page._on_export()
+        _drain_export(page, qapp)
+
+        assert not (tmp_path / "song_轴1.lrc").exists()
+        assert not (tmp_path / "song_轴1.tmp.lrc").exists(), "失败后临时文件应被清理"
+        assert (tmp_path / "song_轴2.lrc").is_file(), "其余任务应继续完成"
+        assert page._exporting is False
 
     def test_emoji_trigger_matching_supports_bare_name(self, qapp):
         """触发词按【名】或裸名匹配（手写 custom 行可能不带括号）。"""

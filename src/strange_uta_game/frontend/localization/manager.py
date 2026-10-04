@@ -143,15 +143,19 @@ class _AppTranslator(QTranslator):
 class _FallbackTranslator(QTranslator):
     """跨上下文回退：``self._editor.tr("X")`` 这类"借用别人 tr 入口"的
     调用，Qt 会按 ``self._editor`` 的 *class* 查上下文，而我方抽取器
-    按 *enclosing class* 归类——两者不一致时主翻译器命中失败。本类无
-    视 context，按 source 单键查表。
+    按 *enclosing class* 归类——两者不一致时主翻译器命中失败。本类按
+    source（结合 context）查表。
 
-    加载方式：从同名 .ts 解析出 ``{source: translation}``。**安装顺序**：
+    加载方式：从同名 .ts 解析出 ``{source: [(context, translation), ...]}``。
+    命中规则：先精确匹配 context；未匹配时仅当该源串的**全部**译文唯一
+    才兜底——同一源串在不同上下文有不同译法时，选哪个都可能错，返回
+    源串（简体中文源串本身可读）比给出错误译文更安全。**安装顺序**：
     必须在 ``_AppTranslator`` **之后**安装，Qt 才会先查主翻译器、失败
     再回退到本类。
     """
 
-    _source_fallback: dict[str, str] = {}
+    # source -> [(context, translation), ...]
+    _source_fallback: dict[str, list[tuple[str, str]]] = {}
 
     def isEmpty(self) -> bool:  # type: ignore[override]
         return not self._source_fallback
@@ -162,7 +166,7 @@ class _FallbackTranslator(QTranslator):
         return bool(self._source_fallback)
 
     @staticmethod
-    def _build(ts_path: Path) -> dict[str, str]:
+    def _build(ts_path: Path) -> dict[str, list[tuple[str, str]]]:
         if not ts_path.exists():
             return {}
         try:
@@ -170,8 +174,10 @@ class _FallbackTranslator(QTranslator):
             tree = ET.parse(ts_path)
         except Exception:
             return {}
-        out: dict[str, str] = {}
+        out: dict[str, list[tuple[str, str]]] = {}
         for ctx in tree.getroot().findall("context"):
+            name_el = ctx.find("name")
+            context = name_el.text if name_el is not None and name_el.text else ""
             for msg in ctx.findall("message"):
                 src_el = msg.find("source")
                 tr_el = msg.find("translation")
@@ -182,7 +188,7 @@ class _FallbackTranslator(QTranslator):
                 tr = tr_el.text or ""
                 if not tr:
                     continue
-                out.setdefault(src_el.text, tr)
+                out.setdefault(src_el.text, []).append((context, tr))
         return out
 
     def translate(  # type: ignore[override]
@@ -192,10 +198,18 @@ class _FallbackTranslator(QTranslator):
         disambiguation: Optional[str] = None,
         n: int = -1,
     ) -> str:
+        entries = self._source_fallback.get(sourceText)
+        if entries:
+            for entry_context, translation in entries:
+                if entry_context == context:
+                    return translation
+            unique = {translation for _ctx, translation in entries}
+            if len(unique) == 1:
+                return next(iter(unique))
         # 关键：未命中时返回 sourceText（**不能**返回空串）。Qt 的
         # 翻译器链一旦有任何一个 isEmpty=False 的 translator，源串
         # 回退就不再生效——返回空串会让最终 tr 结果直接是空串。
-        return self._source_fallback.get(sourceText, sourceText)
+        return sourceText
 
 
 class _PseudoTranslator(QTranslator):

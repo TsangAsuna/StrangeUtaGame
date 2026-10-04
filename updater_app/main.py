@@ -363,12 +363,17 @@ def _relaunch_from_temp(args: "Args", *, log: Optional[logging.Logger] = None) -
     return 0
 
 
-def _cleanup_temp_workdir(work_dir: Path) -> None:
+def _cleanup_temp_workdir(work_dir: Path, keep_parts_version: str = "") -> None:
     """清理 TEMP 工作目录中前次运行残留：旧下载、解压产物、旧 EXE 副本、旧日志。
 
     跳过含有 ``.relocated`` 标记的目录（当前更新器子进程正在其中运行）。
+
+    ``parts/`` 例外：主程序自更新时会把 app part zip 预下载到这里供 Updater
+    增量复用，整体删除会让复用机制永远失效（每次更新白重下上百 MB）。
+    ``keep_parts_version`` 非空（启动期清理）时仅删除文件名不含该版本号的
+    过期 part；为空（更新成功后的最终清理）时整体删除。
     """
-    stale_dirs = ["download", "extracted", "extract-runtime", "extract-app", "parts", "relocated"]
+    stale_dirs = ["download", "extracted", "extract-runtime", "extract-app", "relocated"]
     for name in stale_dirs:
         path = work_dir / name
         if not path.is_dir():
@@ -376,6 +381,26 @@ def _cleanup_temp_workdir(work_dir: Path) -> None:
         if (path / ".relocated").exists():
             continue  # 子进程正在此目录中运行，跳过
         shutil.rmtree(str(path), ignore_errors=True)
+
+    parts_dir = work_dir / "parts"
+    if keep_parts_version:
+        # 按目标版本清过期：当前版本的 part zip 保留给增量复用，
+        # 其余（旧版本残留 / 与本次更新无关的文件）删除。
+        if parts_dir.is_dir():
+            version_marker = f"v{keep_parts_version}"
+            for p in parts_dir.iterdir():
+                if version_marker in p.name:
+                    continue
+                try:
+                    if p.is_dir():
+                        shutil.rmtree(str(p), ignore_errors=True)
+                    else:
+                        p.unlink()
+                except OSError:
+                    pass
+    else:
+        if parts_dir.is_dir():
+            shutil.rmtree(str(parts_dir), ignore_errors=True)
 
     for p in work_dir.glob("Updater-*.exe"):
         try:
@@ -711,7 +736,7 @@ def try_fetch_sha256(success_url: str, proxies: Optional[dict], log: logging.Log
     * 用 ``<成功的 zip URL> + ".sha256"`` 拼接 sha256 URL —— 因为 GitHub Release
       所有资产都在同一目录下，镜像源（gh-proxy 各节点）也透传相同路径；
     * 取首个连续 64 位十六进制子串作为摘要，对换行 / 行尾空格 / 大小写宽容；
-    * 任何失败都返回 ``""``，由上游降级为"跳过校验"。
+    * 任何失败都返回 ``""``，由上游拒绝安装（fail-closed，不再跳过校验）。
     """
     if not success_url:
         return ""
@@ -743,8 +768,11 @@ def try_fetch_sha256(success_url: str, proxies: Optional[dict], log: logging.Log
 
 def verify_sha256(file_path: Path, expected_hex: str, log: logging.Logger) -> bool:
     if not expected_hex:
-        log.info("未提供 SHA-256，跳过校验")
-        return True
+        # fail-closed：.sha256 拉取失败（或未传 --sha256）时拒绝安装。
+        # 放行未经校验的字节等于把更新链完整性交给出处不明的镜像；
+        # 发布流程保证每个 zip 都有同名 .sha256 资产，正常不会误拒。
+        log.error("未获取到 SHA-256（.sha256 拉取失败或未传 --sha256），拒绝安装")
+        return False
     log.info("校验 SHA-256 中...")
     h = hashlib.sha256()
     try:
@@ -1509,8 +1537,9 @@ def run(
     if extra_log_handler is not None:
         log.addHandler(extra_log_handler)
 
-    # 清理前次运行残留的临时文件
-    _cleanup_temp_workdir(work_dir)
+    # 清理前次运行残留的临时文件。parts/ 按目标版本清过期：主程序自更新
+    # 时预下载的当前版本 part zip 必须保留，否则增量复用机制永远失效。
+    _cleanup_temp_workdir(work_dir, keep_parts_version=args.target_version)
 
     # 0. 自检：如果更新器的 _internal 与主程序共享同一目录（junction/copytree），
     #    则需要搬迁到 TEMP 以便拥有独立的运行副本，解除 DLL 文件锁。

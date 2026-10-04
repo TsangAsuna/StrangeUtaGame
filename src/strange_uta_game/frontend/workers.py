@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -473,6 +474,79 @@ class ProjectTaskWorker(QObject):
             self.error.emit(str(e))
 
 
+class ExportTaskWorker(QObject):
+    """在后台线程执行导出任务列表（导出移出 UI 线程 + 原子落盘）。
+
+    jobs 为界面侧预计算好的任务列表，每项::
+
+        {"file_path": 最终目标路径, "format_name": 格式名, "kwargs": {...}}
+
+    逐任务执行：先写同目录临时文件，成功后 ``os.replace`` 原子替换目标
+    （避免中途异常留下截断的正式文件）；失败清理临时文件并记录。
+    ``request_cancel()`` 在任务间生效（单个任务内部不可中断）。
+
+    临时文件名形如 ``<主名>.tmp<扩展名>``（如 song.tmp.lrc）：导出器的
+    ``_ensure_extension`` 会把非目标扩展名的末段替换为格式扩展名，
+    临时文件必须以正式扩展名收尾才不会被导出器改写路径。
+    """
+
+    progress = pyqtSignal(str, int, int)  # (阶段文字, 当前完成数, 总数)
+    finished = pyqtSignal(object)         # {"exported": [...], "failed": [(path, msg)], "cancelled": bool}
+    error = pyqtSignal(str)
+
+    def __init__(self, project_copy: Project, export_service, jobs: list):
+        super().__init__()
+        self._project = project_copy
+        self._export_service = export_service
+        self._jobs = jobs
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        exported: list = []
+        failed: list = []
+        cancelled = False
+        try:
+            total = len(self._jobs)
+            for done, job in enumerate(self._jobs):
+                if self._cancelled:
+                    cancelled = True
+                    break
+                target = job["file_path"]
+                target_path = Path(target)
+                ext = job.get("ext") or target_path.suffix
+                tmp_path = str(target_path.with_name(f"{target_path.stem}.tmp{ext}"))
+                try:
+                    result = self._export_service.export(
+                        self._project, job["format_name"], tmp_path, **job["kwargs"]
+                    )
+                    if result.success:
+                        os.replace(tmp_path, target)
+                        exported.append(target)
+                    else:
+                        _silent_unlink(tmp_path)
+                        failed.append((target, result.error_message or ""))
+                except Exception as e:  # noqa: BLE001  # 单任务失败不拖垮整批
+                    _silent_unlink(tmp_path)
+                    failed.append((target, f"{type(e).__name__}: {e}"))
+                self.progress.emit(self.tr("导出中"), done + 1, total)
+            self.finished.emit(
+                {"exported": exported, "failed": failed, "cancelled": cancelled}
+            )
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+def _silent_unlink(path: str) -> None:
+    """best-effort 删除文件（失败静默，如 .tmp 已不存在）。"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 # ──────────────────────────────────────────────
 # LLM 注音连通性测试
 # ──────────────────────────────────────────────
@@ -519,10 +593,13 @@ class LyricReadWorker(QObject):
     def run(self) -> None:
         try:
             path = Path(self._file_path)
-            try:
-                content = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = path.read_text(encoding="shift_jis")
+            # 统一编码回退链（BOM → utf-8-sig → cp932 → gb18030 → big5），
+            # 与歌词解析器/项目导入一致；GBK/Big5 歌词不再乱码。
+            from strange_uta_game.backend.infrastructure.parsers.encoding import (
+                decode_lyric_bytes,
+            )
+
+            content, _encoding = decode_lyric_bytes(path.read_bytes())
             self.finished.emit(content)
         except Exception as e:
             self.error.emit(str(e))
@@ -575,10 +652,13 @@ class LyricParseWorker(QObject):
             else:
                 self.progress.emit(self.tr("正在读取文件..."))
                 path = Path(self._file_path)
-                try:
-                    content = path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    content = path.read_text(encoding="shift_jis")
+                # 统一编码回退链（BOM → utf-8-sig → cp932 → gb18030 → big5），
+                # 与歌词解析器/项目导入一致；GBK/Big5 歌词不再乱码。
+                from strange_uta_game.backend.infrastructure.parsers.encoding import (
+                    decode_lyric_bytes,
+                )
+
+                content, _encoding = decode_lyric_bytes(path.read_bytes())
 
             from strange_uta_game.frontend.editor.timing.lyric_loader import (
                 parse_lyric_content,

@@ -64,6 +64,20 @@
 
     <h2>🛠️ <span class="em">故障排查</span></h2>
 
+    <h3>🐍 启动报 Failed to load Python DLL '…_internal\python313.dll' LoadLibrary: 找不到指定的模块</h3>
+    <p>按顺序排查：</p>
+    <ul>
+      <li><b>① 杀毒软件隔离了 python313.dll</b>：打开杀毒软件的<b>隔离区 / 恢复区</b>查找并恢复该文件，
+        把 StrangeUtaGame 所在目录加入<b>白名单 / 信任区</b>后重新解压或重装。</li>
+      <li><b>② 包不完整或解压不全</b>：从<b>官方 GitHub Releases</b> 重新下载完整 zip，用本地解压软件
+        <b>完整解压</b>后再运行，<b>不要在压缩软件的预览窗口里直接双击运行</b>；
+        百度网盘等转载渠道常见缺 runtime 部分，请以官方渠道为准。</li>
+      <li><b>③ 缺 VC++ 运行库</b>：安装 Microsoft Visual C++ Redistributable
+        <code>vc_redist.x64.exe</code>（2015-2022 版）。</li>
+      <li><b>④ 解除锁定</b>：右键 StrangeUtaGame.exe → 属性 → 勾选「解除锁定」→ 确定
+        （Windows 会标记从网络下载的文件）。</li>
+    </ul>
+
     <h3>🔇 打开后没有声音 / 某个音频加载报错</h3>
     <ul>
       <li>发行版自带全套 <b>BASS 解码 DLL</b>（FLAC / OPUS / AAC / AC3 / WMA / DSD / ALAC / WebM）。

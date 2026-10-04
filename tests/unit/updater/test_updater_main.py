@@ -133,3 +133,75 @@ class TestModuleConstants:
         assert mod.POST_EXIT_GRACE_SECONDS > 0
         assert mod.FILE_LOCK_RETRY_COUNT >= 3
         assert mod.FILE_LOCK_RETRY_INTERVAL > 0
+
+
+# ───────────────────────── _cleanup_temp_workdir（parts/ 复用） ─────────────────────────
+
+
+class TestCleanupTempWorkdirParts:
+    """启动期清理必须保留当前版本的 parts/（主程序自更新预下载的增量复用 zip）。"""
+
+    def _make_workdir(self, tmp_path: Path) -> Path:
+        parts = tmp_path / "parts"
+        parts.mkdir()
+        (parts / "StrangeUtaGame-v2.0.0-app.zip").write_bytes(b"x")
+        (parts / "StrangeUtaGame-v1.0.0-app.zip").write_bytes(b"x")
+        download = tmp_path / "download"
+        download.mkdir()
+        (download / "junk.bin").write_bytes(b"x")
+        return tmp_path
+
+    def test_startup_keeps_current_version_parts(self, tmp_path):
+        mod = _get_module()
+        work = self._make_workdir(tmp_path)
+        mod._cleanup_temp_workdir(work, keep_parts_version="2.0.0")
+        # 当前版本的 part zip 保留给增量复用
+        assert (work / "parts" / "StrangeUtaGame-v2.0.0-app.zip").exists()
+        # 其他版本的过期 part 与 download/ 仍被清理
+        assert not (work / "parts" / "StrangeUtaGame-v1.0.0-app.zip").exists()
+        assert not (work / "download").exists()
+
+    def test_final_cleanup_removes_parts(self, tmp_path):
+        mod = _get_module()
+        work = self._make_workdir(tmp_path)
+        mod._cleanup_temp_workdir(work)
+        # 更新成功后的最终清理：整体删除
+        assert not (work / "parts").exists()
+
+    def test_stale_dirs_removed_in_keep_mode(self, tmp_path):
+        mod = _get_module()
+        work = self._make_workdir(tmp_path)
+        extracted = work / "extracted"
+        extracted.mkdir()
+        (extracted / "f").write_bytes(b"x")
+        mod._cleanup_temp_workdir(work, keep_parts_version="2.0.0")
+        assert not extracted.exists()
+
+
+# ───────────────────────── verify_sha256（fail-closed） ─────────────────────────
+
+
+class TestVerifySha256FailClosed:
+    def _file(self, tmp_path: Path) -> Path:
+        f = tmp_path / "a.zip"
+        f.write_bytes(b"PK\x03\x04fake")
+        return f
+
+    def test_missing_expected_refuses(self, tmp_path):
+        """.sha256 拉取失败（expected 为空）必须拒绝安装，不得跳过校验。"""
+        mod = _get_module()
+        assert mod.verify_sha256(self._file(tmp_path), "", logging.getLogger("t")) is False
+
+    def test_matching_digest_passes(self, tmp_path):
+        import hashlib
+
+        mod = _get_module()
+        f = self._file(tmp_path)
+        digest = hashlib.sha256(b"PK\x03\x04fake").hexdigest()
+        assert mod.verify_sha256(f, digest, logging.getLogger("t")) is True
+
+    def test_mismatched_digest_refuses(self, tmp_path):
+        mod = _get_module()
+        assert mod.verify_sha256(
+            self._file(tmp_path), "ab" * 32, logging.getLogger("t")
+        ) is False

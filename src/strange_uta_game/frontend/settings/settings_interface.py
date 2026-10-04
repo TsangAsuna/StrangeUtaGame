@@ -497,8 +497,9 @@ class SettingsInterface(ScrollArea):
                     # 丢弃共享实例前先把未保存修改写盘（交接语义），
                     # 再删文件、清缓存重建——新实例从内嵌默认值读起。
                     AppSettings.reset_shared_instances()
-                    if self._settings._config_path.exists():
-                        self._settings._config_path.unlink()
+                    old_cp = self._settings.config_paths.config
+                    if old_cp is not None and old_cp.exists():
+                        old_cp.unlink()
                     self._settings = AppSettings()
                 self._load_current_settings()
                 InfoBar.success(title=self.tr("设置已重置"), content=self.tr("所有设置已恢复为默认值"),
@@ -700,10 +701,11 @@ class SettingsInterface(ScrollArea):
 
         # ── 4. 网络词典缓存 (lyrics_timing_network_dictionary) ──
         ks_net = ks_config.get("lyrics_timing_network_dictionary")
-        if isinstance(ks_net, dict) and ks_net and s._network_dict_path is not None:
+        net_path = s.config_paths.network_dictionary
+        if isinstance(ks_net, dict) and ks_net and net_path is not None:
             # 整体覆盖缓存文件
             from copy import deepcopy
-            s._save_json(s._network_dict_path, deepcopy(ks_net))
+            s._save_json(net_path, deepcopy(ks_net))
             imported_items.append(self.tr("网络词典缓存"))
 
         # ── 5. 界面主题 (ui_theme) ──

@@ -72,6 +72,13 @@ class SUGApplication(QApplication):
 # 创建应用实例
 app = SUGApplication(_qt_argv)
 
+# 启动期异常兜底：QApplication 创建后立即安装（函数幂等；MainWindow 构造
+# 里的重复调用是 embedded 宿主路径的兜底）。此前兜底装在主窗口构造期，
+# 之前的启动期异常（pythonw 无 stderr）会静默退出且不留 crash.log。
+from strange_uta_game.frontend.crash_guard import install_crash_guard
+
+install_crash_guard(app)
+
 # 所有弹窗都作为普通窗口显示：即使调用方使用 QDialog.exec() 等待返回值，
 # 也不禁用主窗口或其他弹窗，避免多个模态窗口互相争抢导致无法操作。
 from strange_uta_game.frontend.dialog_policy import install_non_modal_dialog_policy
