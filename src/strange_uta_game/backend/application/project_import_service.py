@@ -22,8 +22,9 @@ class ProjectImportError(Exception):
     """项目导入相关错误的统一异常类型。"""
 
 
-# 内联格式特征： [<idx>|HH:MM:SS]
-_INLINE_PATTERN = re.compile(r"\[\d+\|\d{2}:\d{2}:\d{2}\]")
+# 内联格式特征： [<idx>|HH:MM:SS]（分钟段 \d{2,}：与 inline_format 的
+# _TAG_RE 一致，长曲 ≥100 分钟的时间戳同样能被识别 —— F15）
+_INLINE_PATTERN = re.compile(r"\[\d+\|\d{2,}:\d{2}:\d{2}\]")
 # LRC 风格时间标签： [MM:SS.xx] 或 [MM:SS:xx]
 _LRC_PATTERN = re.compile(r"\[\d{1,2}:\d{2}[.:]\d{2,3}\]")
 
@@ -52,6 +53,9 @@ class ProjectImportService:
             ProjectImportError: 读取或解析失败时抛出，原始异常附加为 ``__cause__``。
         """
         # 延迟导入，避免 application 层启动时牵扯 infrastructure 重依赖
+        from strange_uta_game.backend.infrastructure.parsers.encoding import (
+            decode_lyric_bytes,
+        )
         from strange_uta_game.backend.infrastructure.parsers.inline_format import (
             sentences_from_inline_text,
         )
@@ -65,9 +69,12 @@ class ProjectImportService:
         )
 
         try:
-            content = Path(path).read_text(encoding="utf-8")
+            # 公共编码回退链（E1）：不再纯 utf-8 读一遍使后续回退失效
+            content, _encoding = decode_lyric_bytes(Path(path).read_bytes())
         except OSError as e:
             raise ProjectImportError(f"无法读取歌词文件: {e}") from e
+        except UnicodeDecodeError as e:
+            raise ProjectImportError(f"无法解码歌词文件: {e}") from e
 
         try:
             if Path(path).suffix.lower() == ".krl":
@@ -104,6 +111,9 @@ class ProjectImportService:
         from strange_uta_game.backend.infrastructure.parsers.ass_parser import (
             ASSParser,
         )
+        from strange_uta_game.backend.infrastructure.parsers.encoding import (
+            decode_lyric_bytes,
+        )
         from strange_uta_game.backend.infrastructure.parsers.inline_format import (
             sentences_from_inline_text,
         )
@@ -117,9 +127,12 @@ class ProjectImportService:
         )
 
         try:
-            content = Path(path).read_text(encoding="utf-8")
+            # 公共编码回退链（E1）：不再纯 utf-8 读一遍使后续回退失效
+            content, _encoding = decode_lyric_bytes(Path(path).read_bytes())
         except OSError as e:
             raise ProjectImportError(f"无法读取歌词文件: {e}") from e
+        except UnicodeDecodeError as e:
+            raise ProjectImportError(f"无法解码歌词文件: {e}") from e
 
         meta: Dict[str, str] = {}
 

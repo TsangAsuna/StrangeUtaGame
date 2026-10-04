@@ -116,3 +116,114 @@ class TestUpdaterAppArgsParser:
             ("github", "https://a.com/x.zip"),
             ("fastgit", "https://b.com/x.zip"),
         ]
+
+
+# ───────────────────────── sha256 校验（fail-closed）与预取 ─────────────────────────
+
+
+class _FakeResp:
+    def __init__(self, status_code: int = 200, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+
+class TestVerifyZipSha256FailClosed:
+    """主程序自更新 Updater.exe 的 zip 校验：.sha256 拉取失败必须拒绝（I2）。"""
+
+    def _zip(self, tmp_path):
+        p = tmp_path / "app.zip"
+        p.write_bytes(b"PK\x03\x04fake")
+        return str(p)
+
+    def test_sidecar_missing_refuses(self, tmp_path, monkeypatch):
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp(404, ""))
+        assert installer._verify_zip_sha256(self._zip(tmp_path), "https://x/app.zip", None) is False
+
+    def test_sidecar_unparsable_refuses(self, tmp_path, monkeypatch):
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        monkeypatch.setattr(
+            requests, "get", lambda *a, **k: _FakeResp(200, "not-a-hash")
+        )
+        assert installer._verify_zip_sha256(self._zip(tmp_path), "https://x/app.zip", None) is False
+
+    def test_sidecar_fetch_error_refuses(self, tmp_path, monkeypatch):
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        def _boom(*a, **k):
+            raise requests.ConnectionError("network down")
+
+        monkeypatch.setattr(requests, "get", _boom)
+        assert installer._verify_zip_sha256(self._zip(tmp_path), "https://x/app.zip", None) is False
+
+    def test_digest_mismatch_refuses(self, tmp_path, monkeypatch):
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        monkeypatch.setattr(
+            requests, "get", lambda *a, **k: _FakeResp(200, "ab" * 32)
+        )
+        assert installer._verify_zip_sha256(self._zip(tmp_path), "https://x/app.zip", None) is False
+
+    def test_digest_match_passes(self, tmp_path, monkeypatch):
+        import hashlib
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        digest = hashlib.sha256(b"PK\x03\x04fake").hexdigest()
+        monkeypatch.setattr(
+            requests, "get", lambda *a, **k: _FakeResp(200, f"{digest}  app.zip\n")
+        )
+        assert installer._verify_zip_sha256(self._zip(tmp_path), "https://x/app.zip", None) is True
+
+
+class TestFetchAssetSha256:
+    """主程序预取主包 .sha256 透传给 Updater（--sha256）。"""
+
+    def test_parses_digest_from_url_prefix(self, monkeypatch):
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        seen: list[str] = []
+
+        def fake_get(url, **kwargs):
+            seen.append(url)
+            return _FakeResp(200, "cd" * 32 + "  x.zip\n")
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        digest = installer.fetch_asset_sha256(
+            "StrangeUtaGame-v1.0.0.zip",
+            [("github", "https://github.com/o/r/releases/download/v1.0.0/StrangeUtaGame-v1.0.0.zip")],
+        )
+        assert digest == "cd" * 32
+        assert seen[0] == "https://github.com/o/r/releases/download/v1.0.0/StrangeUtaGame-v1.0.0.zip.sha256"
+
+    def test_returns_empty_when_all_sources_fail(self, monkeypatch):
+        import requests
+
+        from strange_uta_game.updater import installer
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp(404, ""))
+        assert (
+            installer.fetch_asset_sha256(
+                "a.zip",
+                [("s1", "https://h1/a.zip"), ("s2", "https://h2/a.zip")],
+            )
+            == ""
+        )
+
+    def test_empty_urls_returns_empty(self):
+        from strange_uta_game.updater import installer
+
+        assert installer.fetch_asset_sha256("a.zip", []) == ""

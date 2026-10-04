@@ -72,6 +72,9 @@ class SingerService:
             color_mode=color_mode,
             split_colors=split_colors or [],
             backend_number=next_number,
+            # 排到列表末尾（display_priority 越小越靠前），避免重排过一次后
+            # 新加演唱者因缺省 0 被插到顶部
+            display_priority=len(self._project.singers),
             group=group,
         )
         self._project.add_singer(singer)
@@ -388,9 +391,17 @@ class SingerService:
         if len(self._project.singers) - len(ids_set) < 1:
             return False
 
-        # 是否需要在删除后重新指定默认演唱者
+        # 是否需要转移默认演唱者身份
+        #（域层保护：删除后项目不能失去默认演唱者）
         default = self._project.get_default_singer()
         need_reassign_default = default.id in ids_set
+        if need_reassign_default:
+            if transfer_to is None or self._project.get_singer(transfer_to) is None:
+                return False
+            # 先把默认身份转移给接收者再删除（与原先"删除后重指派"最终状态
+            # 一致，且满足域层默认演唱者保护）
+            for s in self._project.singers:
+                s.is_default = s.id == transfer_to
 
         try:
             for sid in ids:
@@ -399,12 +410,6 @@ class SingerService:
                 self._project.remove_singer(sid, transfer_to)
         except Exception:
             return False
-
-        if need_reassign_default and transfer_to is not None:
-            new_default = self._project.get_singer(transfer_to)
-            if new_default is not None:
-                for s in self._project.singers:
-                    s.is_default = s.id == transfer_to
 
         if self._callbacks.on_singer_removed:
             for sid in ids:

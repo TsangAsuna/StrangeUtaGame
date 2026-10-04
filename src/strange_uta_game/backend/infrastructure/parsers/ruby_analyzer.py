@@ -7,7 +7,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from strange_uta_game.backend.domain import Ruby, RubyPart, Sentence
 from strange_uta_game.backend.infrastructure.parsers.inline_format import (
@@ -562,7 +562,8 @@ class WinRTAnalyzer(KanaDistributingAnalyzer):
     要点（来自调研结论）：
     - WinRT 默认粒度≈Sudachi Mode A，依赖上下文消歧 → 必须按整段输入。
     - GetWords 单次上限 100 字符，超长返回空 → 此处按 ≤100 字切块。
-    - display_text 会半角→全角归一，但字符数 1:1 → surface 取原文切片、不用 display_text。
+    - display_text 会半角→全角等宽度归一，且浊点合成使其与原文长度
+      并非 1:1（「ｶﾞ」→「ガ」）→ surface 按归一化前缀对齐回原文切片。
     - yomi_text 已是平假名。
     """
 
@@ -632,12 +633,15 @@ class WinRTAnalyzer(KanaDistributingAnalyzer):
                 words = self._jpa.get_words(chunk)
                 cursor = 0
                 for w in words:
-                    disp_len = len(w.display_text)
-                    # surface 取原文切片（display_text 已全角归一，不可信）
-                    surface = chunk[cursor : cursor + disp_len]
+                    # display_text 除半角→全角外还会做浊点合成等宽度归一
+                    # （半角浊点假名「ｶﾞ」2 字符 → 「ガ」1 字符），长度并
+                    # 非 1:1——surface 必须按归一化前缀对齐回原文切片
+                    surface, consumed = self._match_surface(
+                        chunk, cursor, w.display_text or ""
+                    )
                     reading = w.yomi_text or surface
                     pairs.append((surface, reading))
-                    cursor += disp_len
+                    cursor += consumed
                 # 兜底：若 GetWords 返回空（超长或异常），逐字回退
                 if cursor < len(chunk):
                     for c in chunk[cursor:]:
@@ -645,6 +649,52 @@ class WinRTAnalyzer(KanaDistributingAnalyzer):
 
             segment_start = segment_end
         return pairs
+
+    @classmethod
+    def _norm_key(cls, text: str) -> str:
+        """归一化比较键：NFKC 后剔除组合浊音符号与空白。
+
+        NFKC 把半角浊音符 ﾞ（U+FF9E）展开为组合符 U+3099、把全角 ゛
+        （U+309B）展开为「空格+U+3099」——两侧产物长度不同但语义等价，
+        直接比较 NFKC 串会漏配；剔除后再比即可把「ｶﾞ」「ガ」「゛ガ」
+        等变体收敛到同一键。仅用于 surface 对齐匹配，不改写原文。
+        """
+        import unicodedata
+
+        return "".join(
+            ch
+            for ch in unicodedata.normalize("NFKC", text)
+            if not unicodedata.combining(ch) and not ch.isspace()
+        )
+
+    @classmethod
+    def _match_surface(
+        cls, chunk: str, start: int, display_text: str
+    ) -> Tuple[str, int]:
+        """从 ``start`` 起把 display_text 对齐回原文切片。
+
+        在原文里找最短切片，使其归一化比较键与 display_text 一致：
+        「ｶﾞ」（2 字符）与「ガ」（1 字符）归一化后相同，即可把
+        display_text 长度失配时的 surface 切片挂回正确原文。找不到精确
+        匹配（WinRT 归一口径差异等）时退回按 display 长度切片（钳制到
+        原文末尾），与旧行为一致。
+        """
+        remaining = len(chunk) - start
+        if remaining <= 0:
+            return "", 0
+        if not display_text:
+            return "", 0
+        target = cls._norm_key(display_text)
+        quick = min(len(display_text), remaining)
+        if cls._norm_key(chunk[start : start + quick]) == target:
+            return chunk[start : start + quick], quick
+        # 归一化可合成（变短）也可展开（如 ヷ），窗口给足余量
+        max_end = min(len(chunk), start + 2 * len(display_text) + 4)
+        for end in range(start + 1, max_end + 1):
+            if cls._norm_key(chunk[start:end]) == target:
+                return chunk[start:end], end - start
+        fallback_end = min(start + len(display_text), len(chunk))
+        return chunk[start:fallback_end], max(1, fallback_end - start)
 
     def get_reading(self, text: str) -> str:
         if not text:
@@ -896,10 +946,34 @@ class PinyinAnalyzer(RubyAnalyzer):
         words = list(self._jieba.cut(text))
         py_result = self._pinyin(words, style=self._style)
 
+        # pypinyin 的返回按条目对齐输入：每个汉字一条，连续非汉字
+        # （英文/数字/标点）合并为一条——条目数与字符数并不相等，
+        # 直接按字符下标索引会把拼音挂错字（如 "ab中文字" 的 中→wén）。
+        # 这里按词游标重放条目，只登记汉字位置的拼音（非汉字字符
+        # 的 reading 本就回退为原字符）。
+        char_pinyin: Dict[int, str] = {}
+        cursor = 0
+        unit = 0
+        for word in words:
+            wi = 0
+            n = len(word)
+            while wi < n:
+                if self._is_chinese_char(word[wi]):
+                    if unit < len(py_result) and py_result[unit]:
+                        char_pinyin[cursor + wi] = py_result[unit][0]
+                    unit += 1
+                    wi += 1
+                else:
+                    # 连续非汉字段整体消费 pypinyin 的单条合并条目
+                    while wi < n and not self._is_chinese_char(word[wi]):
+                        wi += 1
+                    unit += 1
+            cursor += n
+
         results: List[RubyResult] = []
         for i, ch in enumerate(chars):
-            if i < len(py_result) and py_result[i]:
-                reading = py_result[i][0]
+            if i in char_pinyin and char_pinyin[i]:
+                reading = char_pinyin[i]
             else:
                 reading = ch
             results.append(

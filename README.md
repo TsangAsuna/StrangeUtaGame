@@ -865,6 +865,16 @@ Under <b>Settings → Network</b> you can switch dictionary sources (<b>Rhythmic
 
 </details>
 
+<details>
+<summary><b>Q8. 启动报 "Failed to load Python DLL '…_internal\python313.dll' LoadLibrary: 找不到指定的模块"？</b> &nbsp; <i>Startup fails with "Failed to load Python DLL … python313.dll"?</i></summary>
+
+<br/>
+
+按顺序排查：① 杀毒软件<b>隔离</b>了 python313.dll（到杀毒软件隔离区恢复文件，并把软件目录加入白名单）；② <b>包不完整或解压不全</b> —— 从官方 GitHub Releases 重新下载完整 zip，用本地解压软件<b>完整解压</b>后再运行，<b>勿在压缩软件预览中直接运行</b>（百度网盘等转载渠道常见缺 runtime 部分）；③ 缺 <b>VC++ 运行库</b> —— 安装 <code>vc_redist.x64.exe</code>（2015-2022）；④ 右键 exe → 属性 → <b>解除锁定</b>。  
+Troubleshoot in order: ① antivirus <b>quarantined</b> <code>python313.dll</code> — restore it from the quarantine and whitelist the app folder; ② <b>incomplete download/extraction</b> — re-download the full zip from official GitHub Releases and extract it fully with a local unpacker, never run it from the archiver's preview window (re-upload channels like Baidu Netdisk often miss the runtime part); ③ missing <b>VC++ runtime</b> — install <code>vc_redist.x64.exe</code> (2015-2022); ④ right-click the exe → Properties → <b>Unblock</b>.
+
+</details>
+
 <!-- ───────────────────────────── License ───────────────────────────── -->
 
 ## 📜 License

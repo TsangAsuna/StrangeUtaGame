@@ -67,9 +67,8 @@ class Txt2AssExporter(BaseExporter):
         lines.append("")
 
         for sentence in project.sentences:
-            line_text = self._export_sentence(sentence)
-            if line_text:
-                lines.append(line_text)
+            # 空行（用户排版意图）输出空行保留排版；不再因 line_text 为空被吞掉
+            lines.append(self._export_sentence(sentence))
 
         try:
             with open(file_path, "w", encoding="utf-8") as f:
@@ -78,15 +77,15 @@ class Txt2AssExporter(BaseExporter):
             raise ExportError(f"写入文件失败: {e}")
 
     def _export_sentence(self, sentence: Sentence) -> str:
-        """导出一行歌词"""
-        if not sentence.has_timetags:
-            return f"[00:00.00]{sentence.text}"
+        """导出一行歌词
 
-        start_ms = sentence.global_timing_start_ms
-        if start_ms is None:
-            return f"[00:00.00]{sentence.text}"
+        未打轴行不伪造 [00:00.00]（否则所有未打轴行重叠在时间轴 0:00
+        处）：有文本时输出纯文本；空白行输出空行保留用户排版。
+        """
+        if not sentence.has_timetags or sentence.global_timing_start_ms is None:
+            return sentence.text if sentence.text.strip() else ""
 
-        time_str = self._format_timestamp(start_ms, "lrc")
+        time_str = self._format_timestamp(sentence.global_timing_start_ms, "lrc")
         return f"{time_str}{sentence.text}"
 
 
@@ -341,6 +340,22 @@ class ASSDirectExporter(BaseExporter):
                 compound_tail[ci] = tail
         compound_tail_set = {j for tails in compound_tail.values() for j in tails}
 
+        # 连词尾部字符的注音（F10）：尾字无时间戳，无法独立成 \k 段，
+        # 其 ruby parts 并入锚字最后一个 part 段的读音（单 part 锚字即
+        # 首段 |< 处），与 Nicokara 导出把整组读音按序拼接的口径一致，
+        # 不再丢失尾部注音。占位符（停顿符）按现有规则剥离。
+        tail_ruby_text: Dict[int, str] = {}
+        for ci, tail in compound_tail.items():
+            texts = [
+                self._strip_ruby_placeholder(p.text)
+                for j in tail
+                if chars[j].ruby
+                for p in chars[j].ruby.parts
+            ]
+            joined = "".join(t for t in texts if t)
+            if joined:
+                tail_ruby_text[ci] = self._escape_ass_text(joined)
+
         # 3.5 句中停顿（断句轴点）段规划。
         # 默认（锚点间无停顿）：part 段时长 = 下一锚点 ts - 自身 ts，
         # 无 ts 字符并入前一段尾部（legacy 行为）。
@@ -488,6 +503,14 @@ class ASSDirectExporter(BaseExporter):
                 prev_char_idx = ci
                 prev_effective_id = effective_id
 
+            # 连词尾字注音挂在锚字的最后一个 part 段（读音顺序与 Nicokara
+            # 整组拼接一致：锚字 parts 在前、尾字 parts 在后）
+            tail_reading = (
+                tail_ruby_text.get(ci, "")
+                if pi == len(ch.global_timestamps) - 1
+                else ""
+            )
+
             if pi == 0:
                 # 该字第一段：写字符（+ 连词尾部字符 + 可选首 part ruby）
                 kanji = self._escape_ass_text(ch.char)
@@ -499,7 +522,10 @@ class ASSDirectExporter(BaseExporter):
                     first_part_text = self._escape_ass_text(
                         self._strip_ruby_placeholder(ch.ruby.parts[0].text)
                     )
-                    seg_body = f"{kanji}|<{first_part_text}"
+                    seg_body = f"{kanji}|<{first_part_text}{tail_reading}"
+                elif tail_reading:
+                    # 锚字自身无 ruby 但连词尾字有注音：以尾字注音为首段 ruby
+                    seg_body = f"{kanji}|<{tail_reading}"
                 else:
                     seg_body = kanji
             else:
@@ -510,7 +536,7 @@ class ASSDirectExporter(BaseExporter):
                     part_text = self._escape_ass_text(
                         self._strip_ruby_placeholder(ch.ruby.parts[pi].text)
                     )
-                seg_body = f"#|{part_text}"
+                seg_body = f"#|{part_text}{tail_reading}"
 
             # 追加该段尾巴的无 ts 文字（标点等）
             seg_body += tail_text.get(seg_idx, "")

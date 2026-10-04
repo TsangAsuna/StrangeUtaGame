@@ -654,6 +654,29 @@ class LineDetailDialog(QDialog):
             for s in self._project.singers:
                 name_to_id[s.name] = s.id
 
+        # 演唱者列以逗号分隔：名称含逗号会把序列切错位，使该字符的
+        # singer_id 被静默清空。本行用到此类演唱者时中止保存并提示。
+        used_singer_ids = {c.singer_id for c in characters if c.singer_id}
+        dangerous_names = [
+            name
+            for name, sid in name_to_id.items()
+            if "," in name and sid in used_singer_ids
+        ]
+        if dangerous_names:
+            InfoBar.error(
+                title=self.tr("无法保存：演唱者名含逗号"),
+                content=self.tr(
+                    "以下演唱者名称包含分隔符「,」，会破坏演唱者列的逗号分隔，"
+                    "请先在演唱者界面改名：\n{names}"
+                ).format(names="\n".join(dangerous_names)),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=8000,
+                parent=self,
+            )
+            return
+
         # Phase 1: 逐行解析 + 校验
         errors: List[str] = []
         parsed_rows: List[Optional[dict]] = []
@@ -683,6 +706,16 @@ class LineDetailDialog(QDialog):
                 _build_row_chars(data, global_offset, self.sentence.singer_id)
             )
 
+        # 表格 6 列承载不了字符级标志（强制演唱者标签/导唱待办/导唱）。
+        # 结构未变（字符数一致）时按原位置回填；增删过字符无法对齐才丢弃，
+        # 且仅在原字符确实带标志时提示。
+        structure_changed = len(new_characters) != len(characters)
+        if not structure_changed:
+            for old_ch, new_ch in zip(characters, new_characters):
+                new_ch.force_singer_tag = old_ch.force_singer_tag
+                new_ch.needs_guide = old_ch.needs_guide
+                new_ch.is_guide = old_ch.is_guide
+
         for ch in new_characters:
             ch.set_offset(global_offset)
         self.sentence.characters = new_characters
@@ -690,6 +723,22 @@ class LineDetailDialog(QDialog):
         self._modified = True
         # Refresh the table to show saved state
         self._populate_table()
+
+        if structure_changed and any(
+            (c.force_singer_tag or c.needs_guide or c.is_guide) for c in characters
+        ):
+            InfoBar.warning(
+                title=self.tr("字符级标志已丢弃"),
+                content=self.tr(
+                    "本次保存增删了字符，原有字符上的强制演唱者标签/导唱标记"
+                    "无法按位对齐，已被丢弃"
+                ),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=5000,
+                parent=self,
+            )
 
         InfoBar.success(
             title=self.tr("已保存"),

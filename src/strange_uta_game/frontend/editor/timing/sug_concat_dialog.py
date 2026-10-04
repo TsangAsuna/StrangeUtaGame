@@ -509,6 +509,8 @@ class SugConcatDialog(QDialog):
         # 去掉 ScrollArea 默认边框，使内部卡片与表头严格左对齐
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._container = _DragContainer()
+        # 拖拽排序信号只在初始化时连接一次（_add_card 每次连接会重复触发）
+        self._container.order_changed.connect(self._on_order_changed)
         scroll.setWidget(self._container)
 
         self._empty_hint = CaptionLabel(
@@ -607,7 +609,6 @@ class SugConcatDialog(QDialog):
         card.removed = self._on_card_removed
         self._cards.append(card)
         self._container.add_card(card)
-        self._container.order_changed.connect(self._on_order_changed)
         self._update_ui()
 
     def _on_card_removed(self, index: int):

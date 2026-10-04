@@ -171,9 +171,11 @@ class EditorInterface(QWidget):
         self._long_press_timer.setSingleShot(True)
         self._long_press_timer.setInterval(300)
         self._long_press_timer.timeout.connect(self._on_long_press_timeout)
-        self._pending_press_key: Optional[str] = None
-        self._pending_press_action_short: Optional[str] = None
-        self._pending_press_action_long: Optional[str] = None
+        # A11：长按 pending 按键名保存（key_upper -> (short 动作, long 动作)）。
+        # 旧版单槽实现里后按的键会覆盖先按键的 pending，先按键的短按动作被吞。
+        self._pending_presses: dict[str, tuple[Optional[str], Optional[str]]] = {}
+        # 长按定时器当前跟踪的按键（_pending_presses 中最早的未决键）
+        self._long_press_key: Optional[str] = None
         # 当 cp 标记被点击时，沿 _on_checkpoint_clicked → move_to_checkpoint →
         # on_checkpoint_moved (signal) → _handle_checkpoint_moved →
         # _apply_checkpoint_position 链路同步执行；此标志使后者跳过
@@ -845,7 +847,8 @@ class EditorInterface(QWidget):
         迁移写入列表为 ``[(设置路径, 标准化值)]``，由调用方写回 settings。
 
         取值优先级：``shortcuts.{mode}.{action}`` > 旧扁平 ``shortcuts.{action}``
-        > 设置页 _SHORTCUT_ACTIONS 的模式默认值 > fallback_defaults。
+        （仅 timing_mode，A3：扁平键位是单模式时代的打轴键位，不再注入
+        edit_mode）> 设置页 _SHORTCUT_ACTIONS 的模式默认值 > fallback_defaults。
 
         键冲突规则：**显式绑定（来自设置）不被回退默认值覆盖**。历史上内嵌
         config.json 的 edit_mode 段漏写 delete_timestamp 键时，该动作回退到
@@ -878,11 +881,17 @@ class EditorInterface(QWidget):
 
         for action in action_names:
             mode_raw = settings.get(f"shortcuts.{mode_key}.{action}")
-            flat_raw = settings.get(f"shortcuts.{action}")
+            # 兼容旧 schema（无 mode_key 的扁平 shortcuts.xxx）。A3：扁平键位
+            # 是单模式（打轴）时代的产物，只回填 timing_mode；若同时注入
+            # edit_mode，会把 tag_now 等打轴专属键混入编辑模式键表。
+            flat_raw = (
+                settings.get(f"shortcuts.{action}")
+                if mode_key == "timing_mode"
+                else None
+            )
             if mode_raw is not None:
                 raw, explicit = mode_raw, True
             elif flat_raw is not None:
-                # 兼容旧 schema（无 mode_key 的扁平 shortcuts.xxx）
                 raw, explicit = flat_raw, True
             else:
                 raw = mode_defaults.get(action, fallback_defaults[action])
@@ -5043,6 +5052,9 @@ class EditorInterface(QWidget):
                                   if last_char.is_sentence_end
                                      and last_char.sentence_end_ts is not None
                                   else prev_ts + tail_offset_ms)
+                        # A10：脏数据（停顿点时间戳早于前方锚点 / 负 tail_offset）
+                        # 会让 end_ts < prev_ts，均分产生递减时间戳；钳到不早于锚点。
+                        end_ts = max(end_ts, prev_ts)
                         time_diff = end_ts - prev_ts
                         for idx, ci in enumerate(range(segment_start, segment_end)):
                             ts = prev_ts + time_diff * (idx + 1) // (segment_len + 1)
@@ -5898,6 +5910,8 @@ class EditorInterface(QWidget):
                 metronome.stop()
             # 停止位置拉取定时器
             self._position_poll_timer.stop()
+            # A7：清掉仍按住的打轴键，悬挂键会吞掉下次播放同键的 press
+            self._pressed_keys.clear()
             # 切换到编辑模式时校验所有行时间戳
             self._validate_all_timestamps()
 
@@ -5922,6 +5936,8 @@ class EditorInterface(QWidget):
                 metronome.stop()
             # 停止位置拉取定时器
             self._position_poll_timer.stop()
+            # A7：清掉仍按住的打轴键，悬挂键会吞掉下次播放同键的 press
+            self._pressed_keys.clear()
             # 切换到编辑模式时校验所有行时间戳
             self._validate_all_timestamps()
 
@@ -6136,7 +6152,16 @@ class EditorInterface(QWidget):
         if not self._timing_service:
             return
 
+        # A4：注音分析完成后会整体替换 sentences，分析期间打轴会被静默回滚
+        if self._reject_during_ruby_analysis():
+            return
+
         try:
+            # A2：暂停态点击「打轴」时 service 会自动开播（on_timing_key_pressed
+            # 内部 engine.play()），但不经过 _on_play——播放头冻结、进度条不动、
+            # UI 与引擎失同步。先走 _on_play 让 UI 状态先同步。
+            if not self._timing_service.is_playing():
+                self._on_play()
             self._timing_service.on_timing_key_pressed("SPACE")
             self._timing_service.on_timing_key_released("SPACE")
         except Exception as e:
@@ -6164,17 +6189,44 @@ class EditorInterface(QWidget):
         规则：
         - 每个字符允许的时间戳数量 = check_count + (1 if is_sentence_end else 0)
         - timestamps 列表长度不允许超过 check_count
-        - 如果有冗余时间戳，截断并推送至 ruby
+        - 如果有冗余时间戳，截断并推送至 ruby；A9：截断会改写（导入）轴，
+          经 SentenceSnapshotCommand 入撤销栈，用户可以撤销这次自动截断，
+          不再是静默丢失。
         """
         if not self._project or line_idx < 0 or line_idx >= len(self._project.sentences):
             return
         sentence = self._project.sentences[line_idx]
+        before_sentences = None
         for ch in sentence.characters:
             max_timestamps = ch.check_count
             if len(ch.timestamps) > max_timestamps:
+                # 快照须在第一次截断前拍，只对确实发生截断的行入栈
+                if before_sentences is None:
+                    before_sentences = deepcopy(self._project.sentences)
                 ch.timestamps = ch.timestamps[:max_timestamps]
                 ch._update_offset_timestamps()
                 ch.push_to_ruby()
+        if before_sentences is None:
+            return
+        command_manager = (
+            self._timing_service.command_manager if self._timing_service else None
+        )
+        if command_manager is not None:
+            undo_pos = (self._current_line_idx, self.preview._current_char_idx)
+            cmd = SentenceSnapshotCommand(
+                self._project,
+                before_sentences,
+                self._project.sentences,  # execute() 内会自行 deepcopy
+                self.tr("校验时间戳（截断超长 timestamps）"),
+            )
+            cmd.undo_position = undo_pos
+            cmd.redo_position = undo_pos
+            command_manager.execute(cmd)
+            # 句子列表被整体替换，刷新预览与波形时间标签
+            self.refresh_lyric_display()
+            self._update_time_tags_display()
+            if hasattr(self, "_store") and self._store:
+                self._store.notify("timetags")
 
     def _validate_all_timestamps(self) -> None:
         """校验项目中所有行的时间戳（切换到编辑模式时调用）"""
@@ -6651,6 +6703,38 @@ class EditorInterface(QWidget):
         if hasattr(self, "_store") and self._store:
             self._store.notify(change_type)
 
+    def _ruby_analysis_in_progress(self) -> bool:
+        """注音分析（含按类型删除注音等异步任务）是否进行中。
+
+        五个异步分析站点均以 ``_ruby_analyzing`` / ``_ruby_subset_analyzing``
+        作为忙碌标志（见 _on_delete_rubies_by_type 等），此处与既有互斥机制
+        保持同一判定。
+        """
+        return bool(
+            getattr(self, "_ruby_analyzing", False)
+            or getattr(self, "_ruby_subset_analyzing", False)
+        )
+
+    def _reject_during_ruby_analysis(self) -> bool:
+        """A4：注音分析期间拒绝打轴/结构编辑输入。
+
+        异步分析完成后会以 SentenceSnapshotCommand 整体替换
+        ``project.sentences``，分析期间写入的打轴/编辑会被静默回滚；
+        这里复用既有忙碌/互斥机制提前拒绝并提示，返回 True 表示已拒绝。
+        """
+        if not self._ruby_analysis_in_progress():
+            return False
+        InfoBar.warning(
+            title=self.tr("注音分析进行中"),
+            content=self.tr("请等待当前注音分析完成后再试"),
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=2500,
+            parent=self,
+        )
+        return True
+
     def _execute_structural_edit(
         self,
         description: str,
@@ -6658,6 +6742,10 @@ class EditorInterface(QWidget):
         move_cp: bool = True,
     ) -> bool:
         if not self._project:
+            return False
+
+        # A4：分析完成后整体替换 sentences，期间的结构编辑会被回滚
+        if self._reject_during_ruby_analysis():
             return False
 
         undo_pos = (self._current_line_idx, self.preview._current_char_idx)
@@ -8143,14 +8231,16 @@ class EditorInterface(QWidget):
 
     def _on_long_press_timeout(self):
         """长按定时器超时，执行 long 动作。"""
-        action = self._pending_press_action_long
-        key_name = self._pending_press_key
-        # 清除 pending 状态（标记为已处理长按）
-        self._pending_press_key = None
-        self._pending_press_action_short = None
-        self._pending_press_action_long = None
-        if action:
-            self._execute_action(action, 0)
+        key_name = self._long_press_key
+        # 清除被跟踪键的 pending 状态（标记为已处理长按）
+        pending = self._pending_presses.pop(key_name, None) if key_name else None
+        self._long_press_key = None
+        if pending is not None and pending[1]:
+            self._execute_action(pending[1], 0)
+        # A11：还有其他未决按键时，为下一个键重启长按判定窗口
+        if self._pending_presses:
+            self._long_press_key = next(iter(self._pending_presses))
+            self._long_press_timer.start()
 
     def eventFilter(self, obj, event):
         """捕获 preview 子控件的键盘和鼠标交互，触发自动滚动挂起。"""
@@ -8175,6 +8265,29 @@ class EditorInterface(QWidget):
                 self._auto_scroll_mouse_press_pos = None
                 self._suspend_auto_scroll()
         return False
+
+    def _clamp_queue_delay(self, queue_delay_ms: int) -> int:
+        """A12：卡顿补偿值钳制到 500ms 上限。
+
+        超过 500ms 说明 UI 线程发生了严重卡顿——旧实现直接清零，会让时间戳
+        比可听时刻晚一整个卡顿时长；这里改为钳制到 500ms，并弹一次 InfoBar
+        提醒（按时间节流，防止连续按键刷屏）。
+        """
+        if queue_delay_ms <= 500:
+            return queue_delay_ms
+        now = time.monotonic()
+        if now >= getattr(self, "_queue_delay_warn_after_s", 0.0):
+            self._queue_delay_warn_after_s = now + 10.0
+            InfoBar.warning(
+                title=self.tr("界面卡顿"),
+                content=self.tr("检测到界面卡顿超过 500ms，打轴时间可能存在偏差"),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+                parent=self,
+            )
+        return 500
 
     def keyPressEvent(self, a0: Optional[QKeyEvent]):
         if a0 is None:
@@ -8236,12 +8349,18 @@ class EditorInterface(QWidget):
 
         # tag_now / tag_now_extra 使用 press/release 语义，立即执行，不走长按检测
         if action_short in ("tag_now", "tag_now_extra") or action_long in ("tag_now", "tag_now_extra"):
+            # A3：auto-repeat 过滤必须先于 not playing 分支——否则未播放时
+            # 长按一次会连发几十次 _add_checkpoint 结构编辑
+            if a0.isAutoRepeat():
+                a0.ignore()
+                return
+            # A4：注音分析完成后整体替换 sentences，分析期间拒绝打轴
+            if self._reject_during_ruby_analysis():
+                a0.accept()
+                return
             if not playing:
                 self._add_checkpoint()
                 a0.accept()
-                return
-            if a0.isAutoRepeat():
-                a0.ignore()
                 return
             if self._timing_service and key_name not in self._pressed_keys:
                 # 按键音：普通 cp → 按下时播放 press；停顿点 cp → 忽略（等 release）
@@ -8252,8 +8371,7 @@ class EditorInterface(QWidget):
                     self._pressed_keys.add(key_name)
                     # handler 入口到此刻的同步处理耗时（非 Qt 队列等待时间）
                     queue_delay_ms = max(0, int((time.monotonic() - handler_entry_s) * 1000))
-                    if queue_delay_ms > 500:
-                        queue_delay_ms = 0
+                    queue_delay_ms = self._clamp_queue_delay(queue_delay_ms)
                     self._timing_service.on_timing_key_pressed(key_name, queue_delay_ms)
                 except Exception as e:
                     self._pressed_keys.discard(key_name)
@@ -8263,12 +8381,17 @@ class EditorInterface(QWidget):
 
         # tag_and_delete_next：同样使用 press/release 语义，不走长按检测
         if action_short == "tag_and_delete_next" or action_long == "tag_and_delete_next":
+            # A3：同上，auto-repeat 过滤先于 not playing 分支
+            if a0.isAutoRepeat():
+                a0.ignore()
+                return
+            # A4：注音分析期间拒绝打轴
+            if self._reject_during_ruby_analysis():
+                a0.accept()
+                return
             if not playing:
                 self._add_checkpoint()
                 a0.accept()
-                return
-            if a0.isAutoRepeat():
-                a0.ignore()
                 return
             if self._timing_service and key_name not in self._pressed_keys:
                 if self._keysound_player is not None:
@@ -8277,8 +8400,7 @@ class EditorInterface(QWidget):
                 try:
                     self._pressed_keys.add(key_name)
                     queue_delay_ms = max(0, int((time.monotonic() - handler_entry_s) * 1000))
-                    if queue_delay_ms > 500:
-                        queue_delay_ms = 0
+                    queue_delay_ms = self._clamp_queue_delay(queue_delay_ms)
                     self._timing_service.on_tag_and_delete_next_pressed(key_name, queue_delay_ms)
                 except Exception as e:
                     self._pressed_keys.discard(key_name)
@@ -8301,10 +8423,12 @@ class EditorInterface(QWidget):
 
         # 有 long 绑定（可能同时有 short）：启动定时器等待区分
         if action_long is not None:
-            self._pending_press_key = key_upper
-            self._pending_press_action_short = action_short
-            self._pending_press_action_long = action_long
-            self._long_press_timer.start()
+            # A11：pending 按键名保存，多键快速连按时互不覆盖；定时器始终
+            # 跟踪最早未决的键，首键短按不再被后续按键吞掉。
+            if not self._long_press_timer.isActive():
+                self._long_press_key = key_upper
+                self._long_press_timer.start()
+            self._pending_presses[key_upper] = (action_short, action_long)
             a0.accept()
             return
 
@@ -8344,6 +8468,10 @@ class EditorInterface(QWidget):
         action_long = self._key_map_long.get(key_upper)
         if action_short in ("tag_now", "tag_now_extra") or action_long in ("tag_now", "tag_now_extra"):
             if not (self._timing_service and self._timing_service.is_playing()):
+                # A7：提前返回前无条件摘键——按住打轴键期间停止/暂停播放时
+                # release 会走到这里，键若留在 _pressed_keys 会吞掉下次播放
+                # 同键的 press（表现成"莫名丢一拍"）
+                self._pressed_keys.discard(key_name)
                 a0.accept()
                 return
             if a0.isAutoRepeat():
@@ -8357,8 +8485,7 @@ class EditorInterface(QWidget):
                 try:
                     # handler 入口到此刻的同步处理耗时（非 Qt 队列等待时间）
                     queue_delay_ms = max(0, int((time.monotonic() - handler_entry_s) * 1000))
-                    if queue_delay_ms > 500:
-                        queue_delay_ms = 0
+                    queue_delay_ms = self._clamp_queue_delay(queue_delay_ms)
                     self._timing_service.on_timing_key_released(key_name, queue_delay_ms)
                 except Exception as e:
                     self._show_runtime_error(str(e))
@@ -8370,6 +8497,8 @@ class EditorInterface(QWidget):
         # tag_and_delete_next 释放处理
         if action_short == "tag_and_delete_next" or action_long == "tag_and_delete_next":
             if not (self._timing_service and self._timing_service.is_playing()):
+                # A7：同上，提前返回前无条件摘键
+                self._pressed_keys.discard(key_name)
                 a0.accept()
                 return
             if a0.isAutoRepeat():
@@ -8381,8 +8510,7 @@ class EditorInterface(QWidget):
                         self._keysound_player.play_release()
                 try:
                     queue_delay_ms = max(0, int((time.monotonic() - handler_entry_s) * 1000))
-                    if queue_delay_ms > 500:
-                        queue_delay_ms = 0
+                    queue_delay_ms = self._clamp_queue_delay(queue_delay_ms)
                     self._timing_service.on_tag_and_delete_next_released(key_name, queue_delay_ms)
                 except Exception as e:
                     self._show_runtime_error(str(e))
@@ -8398,13 +8526,17 @@ class EditorInterface(QWidget):
             return
 
         # 长按/短按释放处理
-        if self._pending_press_key == key_upper and self._long_press_timer.isActive():
+        pending = self._pending_presses.pop(key_upper, None)
+        if pending is not None and self._long_press_timer.isActive():
             # 定时器仍在运行 = 短按（300ms 内释放）
-            self._long_press_timer.stop()
-            action = self._pending_press_action_short
-            self._pending_press_key = None
-            self._pending_press_action_short = None
-            self._pending_press_action_long = None
+            if self._long_press_key == key_upper:
+                self._long_press_timer.stop()
+                self._long_press_key = None
+                # A11：其余键还在 pending 时，为下一个键重启短按判定窗口
+                if self._pending_presses:
+                    self._long_press_key = next(iter(self._pending_presses))
+                    self._long_press_timer.start()
+            action = pending[0]
             if action:
                 self._execute_action(action, key)
             a0.accept()
@@ -8703,6 +8835,9 @@ class EditorInterface(QWidget):
                 metronome.stop()
             # 停止位置拉取定时器
             self._position_poll_timer.stop()
+            # A7：播放结束（引擎自然停止）时清掉仍按住的打轴键，
+            # 悬挂键会吞掉下次播放同键的 press
+            self._pressed_keys.clear()
             # 切换到编辑模式时校验所有行时间戳
             self._validate_all_timestamps()
 

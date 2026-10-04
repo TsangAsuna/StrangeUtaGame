@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from qfluentwidgets import FluentIcon as FIF, SettingCardGroup
 
+from ..app_settings import AppSettings
 from ..cards import ComboSettingCard, DoubleSpinSettingCard, SpinSettingCard, SwitchSettingCard
 from .base import SubSettingInterface
 
@@ -117,7 +118,11 @@ class PlaybackSubInterface(SubSettingInterface):
         self.card_fast_forward.setValue(s.get("timing.fast_forward_ms", 5000))
         self.card_rewind.setValue(s.get("timing.rewind_ms", 5000))
         self.card_auto_play.setChecked(s.get("audio.auto_play_on_load", False))
-        self.card_pause_on_leave.setChecked(s.get("audio.pause_on_leave_timing", True))
+        # .get 默认值统一引用 DEFAULT_SETTINGS（唯一真源），避免与打包 config 漂移
+        self.card_pause_on_leave.setChecked(s.get(
+            "audio.pause_on_leave_timing",
+            AppSettings.DEFAULT_SETTINGS["audio"]["pause_on_leave_timing"],
+        ))
         self.card_hq_speed.setChecked(s.get("audio.hq_speed_change", True))
         self.card_jump_before.setValue(s.get("timing.jump_before_ms", 3000))
         scroll_mode = s.get("timing.scroll_mode", "auto")

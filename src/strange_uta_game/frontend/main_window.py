@@ -762,20 +762,20 @@ class MainWindow(MSFluentWindow):
             self.editorInterface._on_pause()
 
     def _pause_on_leave_timing_enabled(self) -> bool:
-        """读取“离开打轴界面时暂停”设置（默认开启）。"""
+        """读取“离开打轴界面时暂停”设置（默认值取自 DEFAULT_SETTINGS）。"""
         try:
+            from strange_uta_game.frontend.settings.app_settings import AppSettings
+            default = AppSettings.DEFAULT_SETTINGS["audio"]["pause_on_leave_timing"]
             setting_iface = getattr(self, "settingInterface", None)
             if setting_iface is not None:
                 return bool(
                     setting_iface.get_settings().get(
-                        "audio.pause_on_leave_timing", True
+                        "audio.pause_on_leave_timing", default
                     )
                 )
-            from strange_uta_game.frontend.settings.app_settings import AppSettings
-
-            return bool(AppSettings().get("audio.pause_on_leave_timing", True))
+            return bool(AppSettings().get("audio.pause_on_leave_timing", default))
         except Exception:
-            return True
+            return False
 
     # ==================== 项目操作 ====================
 
@@ -1309,6 +1309,13 @@ class MainWindow(MSFluentWindow):
                 proxy_url=proxy_url,
                 locale=upd_installer._get_current_locale(),
             )
+            # 预取主包 .sha256 透传给 Updater（--sha256）；拉取失败置空，
+            # Updater 侧会再次尝试并在仍拿不到时拒绝安装（fail-closed）。
+            plan.expected_sha256 = upd_installer.fetch_asset_sha256(
+                result.primary_asset_name,
+                list(result.download_candidates),
+                proxy_url,
+            )
 
             # launch_updater 内部会调用 _update_updater_from_remote 发起 HTTP 请求，
             # 同步调用会冻结 UI；改为在后台线程中执行（与 update_card.py 保持一致）。
@@ -1574,9 +1581,9 @@ class MainWindow(MSFluentWindow):
 
     # ==================== 窗口事件 ====================
 
-    def _on_save_project(self):
+    def _on_save_project(self) -> bool:
         """从任意页面触发保存"""
-        self._on_global_save()
+        return self._on_global_save()
 
     def _on_global_save(self) -> bool:
         """全局 Ctrl+S 保存（异步，委托给 ProjectStore）"""
@@ -1782,6 +1789,11 @@ class MainWindow(MSFluentWindow):
                 # 异步保存可能赶不及在退出前完成 _on_save_success，这里同步补一份
                 # 命名备份到 ProjectBackup，确保关闭即有备份兜底。
                 self._store.create_backup()
+                # 等待在途保存线程把 .sug 写完再退出：立即 quit 会把仍在写盘
+                # 的保存线程一并杀死，留下截断的项目文件。同槽位保存被跳过
+                # （_on_global_save 返回 False）时等待的正是那次在途保存；
+                # 无在途保存时立即返回。
+                self._store.wait_for_manual_save()
                 # 保存后清理临时文件
                 self._store.cleanup_temp_files()
             elif choice == 1:  # 放弃
@@ -1835,6 +1847,16 @@ class MainWindow(MSFluentWindow):
         """
         import os as _os
         self._force_quitting = True
+        # 硬退前尽力排空 AppSettings 的写盘锁：daemon 线程（网络词典自动更新
+        # 等）可能正持 _io_lock 写 config.json，os._exit 会把它截断成半截文件。
+        # RLock 拿到后**故意不释放**——持有期间主线程自身的保存（RLock 可重入）
+        # 不受影响，其他线程的写入被挡在门外，保证硬退时没有写盘进行到一半。
+        # 拿不到锁（写盘卡死）时按原样硬退，最多等 250ms，不卡退出流程。
+        try:
+            from strange_uta_game.frontend.settings.app_settings import AppSettings
+            AppSettings._io_lock.acquire(timeout=0.25)
+        except Exception:
+            pass
         try:
             self.close()
         except Exception:

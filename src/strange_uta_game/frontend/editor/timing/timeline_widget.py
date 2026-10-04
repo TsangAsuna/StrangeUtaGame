@@ -233,6 +233,11 @@ class WaveformDisplay(QWidget):
         self._spectrum_worker: Optional[SpectrogramWorker] = None
         self._spectrum_view_cache: Optional[np.ndarray] = None
         self._spectrum_view_cache_key: Optional[tuple] = None
+        # 静态层重建用的最终 RGBA QImage（与 view 缓存同键缓存，避免逐帧分配；
+        # QImage 不持有 buffer 引用，bytes 必须随缓存一并保活）
+        self._spectrum_image_cache: Optional[QImage] = None
+        self._spectrum_image_cache_buffer: Optional[bytes] = None
+        self._spectrum_image_cache_key: Optional[tuple] = None
         self._spectrum_lut_cache: Optional[np.ndarray] = None
         self._spectrum_lut_cache_key: Optional[tuple] = None
 
@@ -308,6 +313,12 @@ class WaveformDisplay(QWidget):
         self._duration_ms = ms
         # 时长变化后重新 clamp，避免旧滚动位置超出新范围
         self._scroll_position = self._clamp_scroll(self._scroll_position)
+        # 换音频/时长变化后拖拽状态必须清场，避免过期锚点残留
+        self._reset_drag()
+        self._lane_dragging = False
+        self._lane_press_global_y = None
+        self._pan_start_x = None
+        self._is_panning = False
         # Keep this method usable by the lightweight non-QWidget test double.
         self._static_layer = None
         self._static_layer_key = None
@@ -585,6 +596,12 @@ class WaveformDisplay(QWidget):
         self._waveform_peak_levels.clear()
         self._cancel_peak_preheat()
         self._reset_spectrum_cache()
+        # 清空音频后拖拽/pan 状态一并清场，避免过期锚点残留
+        self._reset_drag()
+        self._lane_dragging = False
+        self._lane_press_global_y = None
+        self._pan_start_x = None
+        self._is_panning = False
         self._invalidate_static_layer()
         self.update()
 
@@ -652,6 +669,19 @@ class WaveformDisplay(QWidget):
         self._drag_delta_ms = 0
         self._press_handle = None
         self._drag_armed = False
+
+    def event(self, e) -> bool:
+        # 窗口失活（Alt+Tab 等）时统一清场：进行中的把手拖拽/pan/交界拖拽
+        # 状态残留会让下次点击复用过期锚点提交错误偏移。
+        if e.type() == QEvent.Type.WindowDeactivate:
+            self._reset_drag()
+            self._lane_dragging = False
+            self._lane_press_global_y = None
+            self._pan_start_x = None
+            self._is_panning = False
+            self.unsetCursor()
+            self._lane_boundary_hovered = False
+        return super().event(e)
 
     # ── 视窗 / 坐标换算 ──
 
@@ -1029,6 +1059,9 @@ class WaveformDisplay(QWidget):
         self._display_mode = mode
         self._apply_display_height()
         self._spectrum_view_cache = None
+        self._spectrum_image_cache = None
+        self._spectrum_image_cache_buffer = None
+        self._spectrum_image_cache_key = None
         if mode in ("spectrum", "dual"):
             self._ensure_spectrum()
         else:
@@ -1325,6 +1358,9 @@ class WaveformDisplay(QWidget):
         self._spectrum_error = ""
         self._spectrum_view_cache = None
         self._spectrum_view_cache_key = None
+        self._spectrum_image_cache = None
+        self._spectrum_image_cache_buffer = None
+        self._spectrum_image_cache_key = None
 
     def _ensure_spectrum(self) -> None:
         if not self._spectrum_active:
@@ -1430,6 +1466,9 @@ class WaveformDisplay(QWidget):
         self._spectrum_state = "ready"
         self._spectrum_view_cache = None
         self._spectrum_view_cache_key = None
+        self._spectrum_image_cache = None
+        self._spectrum_image_cache_buffer = None
+        self._spectrum_image_cache_key = None
         self._invalidate_static_layer()
         self.update()
 
@@ -1561,10 +1600,23 @@ class WaveformDisplay(QWidget):
         if view is None:
             return
         lut = self._spectrum_lut()
-        # 翻转行序（顶行 = 高频）并转成 QImage 需要的 (H, W, 4) 行主序。
-        rgba = np.ascontiguousarray(lut[np.flipud(view.T)])
-        buffer = rgba.tobytes()
-        image = QImage(buffer, w, h, w * 4, QImage.Format.Format_RGBA8888)
+        # 与 _spectrum_view_cache 同键缓存最终 RGBA QImage：拖拽/滚动逐帧
+        # 重建静态层时不再重复 LUT 查表 + flipud + tobytes 的全量分配
+        # （与波形侧 _sample_view_cache 同型优化）。
+        image_key = (self._spectrum_view_cache_key, self._spectrum_lut_cache_key)
+        image = self._spectrum_image_cache
+        if (
+            image is None
+            or self._spectrum_image_cache_key != image_key
+        ):
+            # 翻转行序（顶行 = 高频）并转成 QImage 需要的 (H, W, 4) 行主序。
+            rgba = np.ascontiguousarray(lut[np.flipud(view.T)])
+            buffer = rgba.tobytes()
+            image = QImage(buffer, w, h, w * 4, QImage.Format.Format_RGBA8888)
+            # QImage 不持有 buffer 引用，bytes 必须与 image 一同保活
+            self._spectrum_image_cache = image
+            self._spectrum_image_cache_buffer = buffer
+            self._spectrum_image_cache_key = image_key
         painter.drawImage(0, 0, image)
 
     def _draw_freq_axis(self, painter: QPainter, axis_w: int, h: int) -> None:
@@ -2675,6 +2727,13 @@ class _TimelineHeightHandle(QWidget):
         self._hovered = False
         self.update()
         super().leaveEvent(event)
+
+    def event(self, e) -> bool:
+        # 窗口失活（Alt+Tab 等）时清掉按住状态，避免过期锚点残留
+        if e.type() == QEvent.Type.WindowDeactivate:
+            self._press_global_y = None
+            self.update()
+        return super().event(e)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)

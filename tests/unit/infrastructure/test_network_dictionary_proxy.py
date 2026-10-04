@@ -167,7 +167,8 @@ class TestAutoUpdatePassthrough:
     def test_proxies_forwarded_to_fetch(self, monkeypatch):
         seen: dict = {}
 
-        def _fake_fetch(url, timeout=8.0, allow_insecure_fallback=True, proxies=None):
+        def _fake_fetch(url, timeout=8.0, allow_insecure_fallback=True, proxies=None,
+                        diagnostics=None):
             seen["proxies"] = proxies
             return [{"enabled": True, "word": "あ", "reading": "あ"}]
 

@@ -27,6 +27,7 @@ from strange_uta_game.backend.domain.models import (
     get_ruby_pause_char,
 )
 from strange_uta_game.backend.domain.entities import Sentence
+from strange_uta_game.backend.infrastructure.parsers.lyric_parser import ParseError
 
 
 def _export_timestamps(char: Character) -> List[int]:
@@ -95,13 +96,22 @@ def encode_check_n(
 
 
 def decode_check_n(n_str: str) -> Tuple[int, bool, bool]:
-    """解码 N 字符串到 (check_count, is_line_end, is_sentence_end)。"""
+    """解码 N 字符串到 (check_count, is_line_end, is_sentence_end)。
+
+    健壮化（E4）：容忍空白与 `_TAG_RE` 历史上的 `e` 后缀变体（如 `[1e]`）；
+    仍无法解析时抛 ParseError（而非裸 ValueError）。
+    """
     is_sentence_end = False
     is_line_end = False
+    n_str = n_str.strip().rstrip("e")
     if len(n_str) >= 2 and n_str.endswith("0"):
         is_line_end = True
         n_str = n_str[:-1]
-    return int(n_str), is_line_end, is_sentence_end
+    try:
+        check_count = int(n_str)
+    except ValueError as exc:
+        raise ParseError(f"无效的 N 标记: {n_str!r}") from exc
+    return check_count, is_line_end, is_sentence_end
 
 
 # ──────────────────────────────────────────────
@@ -279,6 +289,26 @@ def align_ruby_parts_to_checkpoints(
 REST_CHAR = "▨"
 RUBY_SEP = "＋"  # 全角加号
 
+# 正文保留字符的最小转义（F11）：`{ } |` 是 inline 格式的结构字符，
+# 歌词原文含这些字符时导出会被解析器误读甚至崩解析。导出替换为
+# 全角形近字，导入再映射回来；无法安全替换的 ＋/▨ 不做处理。
+_INLINE_ESCAPE = {"{": "｛", "}": "｝", "|": "｜"}
+_INLINE_UNESCAPE = {v: k for k, v in _INLINE_ESCAPE.items()}
+
+
+def _escape_inline_text(text: str) -> str:
+    """导出前替换正文中的结构保留字符（F11）。"""
+    for src, dst in _INLINE_ESCAPE.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def _unescape_inline_text(text: str) -> str:
+    """导入时把转义替换字符映射回原字符（F11）。"""
+    for src, dst in _INLINE_UNESCAPE.items():
+        text = text.replace(src, dst)
+    return text
+
 
 def _collect_linked_group(chars: List[Character], start: int) -> Tuple[int, int]:
     """收集从 start 开始的连词字符组的范围。
@@ -306,8 +336,11 @@ def to_inline_text(sentence: Sentence) -> str:
     """将一个 Sentence 序列化为 RhythmicaLyrics 风格内联文本。
 
     连词字符组（linked_to_next=True）会合并输出：
-    - 有注音的连词组：合并成一个 Ruby Node
-    - 无注音的连词组：合并成一个 Normal Node（使用第一个字符的时间戳）
+    - 有注音、或含 cc>0 成员的连词组：合并成一个 Ruby Node（F1：
+      Normal Node 表达不了组内多 cp 成员的连词关系，reimport 会拆散；
+      Ruby Node 的 ＋ 分段能逐成员还原 cc/时间戳，纯 cc=0 组仍走
+      Normal Node、由解析侧 cc=0 连读规则复原）
+    - 全员 cc=0 的无注音连词组：合并成一个 Normal Node
     """
     parts: List[str] = []
     chars = sentence.characters
@@ -321,11 +354,13 @@ def to_inline_text(sentence: Sentence) -> str:
             group_start, group_end = _collect_linked_group(chars, i)
             group_chars = chars[group_start:group_end]
 
-            # 检查连词组中是否有注音
-            has_ruby = any(c.ruby for c in group_chars)
+            # 检查连词组中是否有注音或 cc>0 成员
+            use_ruby_node = any(
+                c.ruby or c.check_count > 0 for c in group_chars
+            )
 
-            if has_ruby:
-                # 有注音的连词组：合并成一个 Ruby Node
+            if use_ruby_node:
+                # 合并成一个 Ruby Node（含 F1 的多 cp 无注音成员路径）
                 parts.append(_linked_group_to_ruby_node(group_chars))
             else:
                 # 无注音的连词组：合并成一个 Normal Node
@@ -349,8 +384,8 @@ def _single_char_to_normal_node(char: Character) -> str:
 
     格式:
     - 无 CP (check_count=0): 直接输出字符本身（如空格）
-    - 有 CP 有时间戳: [1|ts]char
-    - 有 CP 无时间戳: [1]char
+    - 有 CP 有时间戳: [N|ts]char[ts][ts]...（N=check_count，F1）
+    - 有 CP 无时间戳: [N]char
     - 有停顿点 CP 有时间戳: char[10|ts]
     - 有停顿点 CP 无时间戳: char[10]
     """
@@ -362,23 +397,31 @@ def _single_char_to_normal_node(char: Character) -> str:
         if char.is_sentence_end:
             _se = _export_sentence_end_ts(char)
             if _se is not None:
-                return f"{display_char}[10|{format_timestamp(_se)}]"
+                return f"{_escape_inline_text(display_char)}[10|{format_timestamp(_se)}]"
             else:
-                return f"{display_char}[10]"
-        return display_char
+                return f"{_escape_inline_text(display_char)}[10]"
+        return _escape_inline_text(display_char)
 
     char_parts: List[str] = []
 
-    # 主时间戳
+    # 主时间戳（F1）：N 按 check_count 输出——硬编码 "1" 只取首个时间戳，
+    # 多拍字符 round-trip 会丢节奏点。N 与停顿点标记 [10] 冲突，
+    # 与 ruby node 路径一致封顶 9。
     _ts_list = _export_timestamps(char)
+    n_out = min(char.check_count, 9)
     if _ts_list:
-        ts = _ts_list[0]
-        char_parts.append(f"[1|{format_timestamp(ts)}]")
+        char_parts.append(f"[{n_out}|{format_timestamp(_ts_list[0])}]")
     else:
-        char_parts.append("[1]")
+        char_parts.append(f"[{n_out}]")
 
     # 字符本身
-    char_parts.append(display_char)
+    char_parts.append(_escape_inline_text(display_char))
+
+    # 补充 checkpoint（F1）：其余时间戳用无前缀 [ts] 补充标签
+    # （解析器本就支持），放在字符之后归属前一字
+    if _ts_list:
+        for extra_ts in _ts_list[1:n_out]:
+            char_parts.append(f"[{format_timestamp(extra_ts)}]")
 
     # 停顿点标记
     if char.is_sentence_end:
@@ -396,7 +439,8 @@ def _single_char_to_ruby_node(char: Character) -> str:
 
     格式:
     - 有时间戳: {display|[count|ts]ruby[ts]ruby}
-    - 无时间戳: {display|[count]ruby}
+    - 无时间戳: {display|[N]part1[N]part2}（F4：无 ts 的 part 用 [N] 型
+      分隔，N=check_count——保留分段结构与 cc=0 无 mora 形态，可往返）
     - 有停顿点 CP 有时间戳: ...}[10|ts]
     - 有停顿点 CP 无时间戳: ...}[10]
 
@@ -404,8 +448,8 @@ def _single_char_to_ruby_node(char: Character) -> str:
     （RhythmicaLyrics），占位拍在该侧是有意义的，不剥离。
     """
     assert char.ruby is not None
-    display = char.char
-    ruby_segments = [p.text for p in char.ruby.parts]
+    display = _escape_inline_text(char.char)
+    ruby_segments = [_escape_inline_text(p.text) for p in char.ruby.parts]
 
     # Ruby count
     count = min(len(ruby_segments), 9)
@@ -423,6 +467,9 @@ def _single_char_to_ruby_node(char: Character) -> str:
                     portion_str += f"{format_timestamp(ts)}]"
                 else:
                     portion_str += f"[{format_timestamp(ts)}]"
+            elif cp_idx > 0:
+                # 该拍无时间戳（F4）：用 [N] 型分隔，防止分段被合并
+                portion_str += f"[{count}]"
 
             # ruby 文本始终输出
             if cp_idx < len(ruby_segments):
@@ -433,9 +480,12 @@ def _single_char_to_ruby_node(char: Character) -> str:
         inner = "".join(mora_portions)
         result = f"{{{display}|[{count}|{inner}}}"
     else:
-        # 无时间戳的情况: {display|[count]ruby}
-        ruby_text = "".join(ruby_segments[:count])
-        result = f"{{{display}|[{count}]{ruby_text}}}"
+        # 无时间戳的情况（F4）：每个 part 用 [N] 型分隔输出。N 取
+        # check_count（cc=0 的无 mora 形态输出 [0]），保留原分段；
+        # 旧实现把 parts 拼成一段，reimport 无法还原分段与 cc。
+        n_out = min(char.check_count, 9)
+        ruby_text = "".join(f"[{n_out}]{seg}" for seg in ruby_segments[:9])
+        result = f"{{{display}|{ruby_text}}}"
 
     # 停顿点标记
     if char.is_sentence_end:
@@ -455,26 +505,30 @@ def _linked_group_to_normal_node(group: List[Character]) -> str:
 
     格式:
     - 无 CP (check_count=0): 直接输出文本
-    - 有 CP 有时间戳: [1|ts]char[1|ts]char...
-    - 有 CP 无时间戳: [1]char[1]char...
+    - 有 CP 有时间戳: [N|ts]char[ts]...（N=check_count，F1）
+    - 有 CP 无时间戳: [N]char
     - 停顿点字符后面加 [10|ts] 或 [10]
     """
     # 无 CP 的字符组直接输出
     if all(c.check_count == 0 for c in group):
-        return "".join(REST_CHAR if c.is_rest else c.char for c in group)
+        return "".join(
+            _escape_inline_text(REST_CHAR if c.is_rest else c.char) for c in group
+        )
 
     parts: List[str] = []
     for i, c in enumerate(group):
-        display_char = REST_CHAR if c.is_rest else c.char
+        display_char = _escape_inline_text(REST_CHAR if c.is_rest else c.char)
 
         if c.check_count > 0:
-            # 有 CP 的字符
+            # 有 CP 的字符：N 按 check_count 输出 + 无前缀 [ts] 补充标签（F1）
             _ts_list = _export_timestamps(c)
+            n_out = min(c.check_count, 9)
             if _ts_list:
-                ts = _ts_list[0]
-                parts.append(f"[1|{format_timestamp(ts)}]{display_char}")
+                parts.append(f"[{n_out}|{format_timestamp(_ts_list[0])}]{display_char}")
+                for extra_ts in _ts_list[1:n_out]:
+                    parts.append(f"[{format_timestamp(extra_ts)}]")
             else:
-                parts.append(f"[1]{display_char}")
+                parts.append(f"[{n_out}]{display_char}")
         else:
             # 无 CP 的字符
             parts.append(display_char)
@@ -498,17 +552,23 @@ def _linked_group_to_ruby_node(group: List[Character]) -> str:
 
     格式: {display|[count|ts]ruby＋＋＋}[10|ts]
 
+    F1：无注音但 cc>0 的成员同样按 ruby node 路径输出自己的多 cp
+    标签（N 按 check_count），reimport 时连词关系与节奏点不丢。
+    F4：无 ts 的 part 用 [N] 型分隔，防止分段被合并。
     停顿符占位 part 原样保留（RL 编辑模式面向打轴软件，不剥离）。
     """
-    display = "".join(c.char for c in group)
+    display = _escape_inline_text("".join(c.char for c in group))
 
     # 构建 ruby 部分
     ruby_portions: List[str] = []
     for c in group:
         if c.ruby:
-            ruby_segments = [p.text for p in c.ruby.parts]
+            ruby_segments = [_escape_inline_text(p.text) for p in c.ruby.parts]
             # 修复核心：针对当前遍历到的字，计算属于它自己的真实 count
             char_count = min(len(ruby_segments), 9)
+            # N 按 check_count 输出（不变式下与 len(parts) 相等；
+            # cc=0 的无 mora 形态输出 [0]，reimport 能还原 cc）
+            n_out = min(c.check_count, 9)
 
             portion_parts: List[str] = []
             _ts_list = _export_timestamps(c)
@@ -518,12 +578,13 @@ def _linked_group_to_ruby_node(group: List[Character]) -> str:
                     ts = _ts_list[cp_idx]
                     # 第一个时间戳前没有 [
                     if cp_idx == 0:
-                        # 写入各自正确的 char_count
-                        part_str += f"[{char_count}|{format_timestamp(ts)}]"
+                        # 写入各自正确的 N
+                        part_str += f"[{n_out}|{format_timestamp(ts)}]"
                     else:
                         part_str += f"[{format_timestamp(ts)}]"
-                elif cp_idx == 0:
-                    part_str += f"[{char_count}]"
+                else:
+                    # 该拍无时间戳（F4）：[N] 型分隔，防止分段被合并
+                    part_str += f"[{n_out}]"
 
                 if cp_idx < len(ruby_segments):
                     part_str += ruby_segments[cp_idx]
@@ -534,16 +595,18 @@ def _linked_group_to_ruby_node(group: List[Character]) -> str:
             ruby_portions.append("".join(portion_parts))
         elif c.check_count > 0:
             _ts_list = _export_timestamps(c)
+            n_out = min(c.check_count, 9)
             portion_parts: List[str] = []
-            for cp_idx in range(min(c.check_count, 9)):
+            for cp_idx in range(n_out):
                 if cp_idx < len(_ts_list):
                     ts = _ts_list[cp_idx]
                     if cp_idx == 0:
-                        portion_parts.append(f"[{c.check_count}|{format_timestamp(ts)}]")
+                        portion_parts.append(f"[{n_out}|{format_timestamp(ts)}]")
                     else:
                         portion_parts.append(f"[{format_timestamp(ts)}]")
-                elif cp_idx == 0:
-                    portion_parts.append(f"[{c.check_count}]")
+                else:
+                    # 该拍无时间戳（F4）：[N] 型分隔
+                    portion_parts.append(f"[{n_out}]")
             ruby_portions.append("".join(portion_parts))
         else:
             # 无注音的字符，输出空的分隔符
@@ -578,8 +641,10 @@ lines_to_inline_text = sentences_to_inline_text
 # 反序列化: 内联文本 → Sentence
 # ──────────────────────────────────────────────
 
-# 正则: 匹配 [N|MM:SS:cc] 或 [MM:SS:cc] 或 [N]（无时间戳）
-_TAG_RE = re.compile(r"\[(?:(\d+e?)\|)?(\d{2}:\d{2}:\d{2})\]")
+# 正则: 匹配 [N|MM:SS:cc] 或 [MM:SS:cc] 或 [N]（无时间戳）。
+# 分钟位宽 \d{2,}（F15）：format_timestamp 对 ≥100 分钟输出 3 位分钟，
+# 旧正则 \d{2} 固定两位会导致长曲时间戳导出后读不回来。
+_TAG_RE = re.compile(r"\[(?:(\d+e?)\|)?(\d{2,}:\d{2}:\d{2})\]")
 _TAG_NO_TS_RE = re.compile(r"\[(\d+e?)\]")
 
 
@@ -748,13 +813,19 @@ lines_from_inline_text = sentences_from_inline_text
 
 
 def _split_ruby_groups(text: str) -> List[Tuple[str, str]]:
-    """将内联文本拆分为 ("ruby", content) 和 ("plain", content) 段。"""
+    """将内联文本拆分为 ("ruby", content) 和 ("plain", content) 段。
+
+    未闭合的 `{`（畸形输入）降级为普通文本段，不再抛裸 ValueError（E4）。
+    """
     result: List[Tuple[str, str]] = []
     i = 0
     while i < len(text):
         if text[i] == "{":
-            # 找匹配的 }
-            end = text.index("}", i + 1)
+            # 找匹配的 }（E4：index→find，未闭合时把余文当普通段）
+            end = text.find("}", i + 1)
+            if end < 0:
+                result.append(("plain", text[i:]))
+                break
             result.append(("ruby", text[i + 1 : end]))
             i = end + 1
         else:
@@ -780,9 +851,16 @@ def _parse_ruby_group(
     格式: "漢字|[count|ts]ruby[ts]ruby[10|ts]"
     - [count|ts]ruby: count 是 1-9，表示 ruby 分段数
     - [10|ts]: 停顿点时间戳（可选，在末尾）
+
+    畸形输入健壮化（E4）：无 `|` 的组降级为普通文本段；N 标记无法
+    解析时按 token 数降级，不抛裸 ValueError。
     """
-    pipe_pos = content.index("|")
-    display_text = content[:pipe_pos]
+    pipe_pos = content.find("|")
+    if pipe_pos < 0:
+        # 无竖线的畸形 ruby 组：按普通文本段还原字符，不抛异常
+        _parse_plain_segment(content, characters, singer_id)
+        return
+    display_text = _unescape_inline_text(content[:pipe_pos])
     ruby_body = content[pipe_pos + 1 :]
 
     display_chars = list(display_text)
@@ -799,7 +877,7 @@ def _parse_ruby_group(
 
         if not tokens:
             # 无 checkpoint 信息
-            ruby_text = portion.strip()
+            ruby_text = _unescape_inline_text(portion.strip())
             ruby_obj = Ruby(parts=[RubyPart(text=ruby_text)]) if ruby_text else None
             character = Character(
                 char=char_text,
@@ -812,11 +890,14 @@ def _parse_ruby_group(
             characters.append(character)
             continue
 
-        # 第一个 token 的 N 是 count（1-9）
+        # 第一个 token 的 N 是 count（1-9）。畸形 N 降级为按 token 数
+        # （E4：不再对 `[1e]` 之类的变体抛裸 ValueError）
         first_n_str = tokens[0][0]
         if first_n_str is not None:
-            count = int(first_n_str)
-            count = min(count, 9)
+            try:
+                count = min(int(first_n_str.rstrip("e")), 9)
+            except ValueError:
+                count = len(tokens)
         else:
             count = len(tokens)
 
@@ -833,21 +914,26 @@ def _parse_ruby_group(
                 is_sentence_end = True
             else:
                 all_timestamps.append(ts_ms)
-                ruby_text_parts.append(seg_text)
+                ruby_text_parts.append(_unescape_inline_text(seg_text))
 
         timestamps = [ts for ts in all_timestamps[:count] if ts is not None]
 
-        # per-char ruby 分段（结构化）。空段（该拍无新文字，如
-        # `[2|ts]か[ts]` 的第二个拍）按占位符（停顿符）还原，段数不足
-        # N 时补齐——维持 len(parts) == check_count 不变式，与
-        # set_check_count 的收口行为一致（外部/手写文件同样适用）。
-        pause = get_ruby_pause_char()
-        ruby_parts = [
-            RubyPart(text=p if p else pause) for p in ruby_text_parts
-        ]
-        if len(ruby_parts) < count:
-            ruby_parts += [RubyPart(text=pause)] * (count - len(ruby_parts))
-        ruby_obj = Ruby(parts=ruby_parts) if ruby_parts else None
+        if ruby_text_parts and not any(ruby_text_parts):
+            # 所有拍都无文本 → 非注音的连词组成员（F1）：只还原字符、
+            # cc 与时间戳，不伪造停顿符 ruby
+            ruby_obj = None
+        else:
+            # per-char ruby 分段（结构化）。空段（该拍无新文字，如
+            # `[2|ts]か[ts]` 的第二个拍）按占位符（停顿符）还原，段数不足
+            # N 时补齐——维持 len(parts) == check_count 不变式，与
+            # set_check_count 的收口行为一致（外部/手写文件同样适用）。
+            pause = get_ruby_pause_char()
+            ruby_parts = [
+                RubyPart(text=p if p else pause) for p in ruby_text_parts
+            ]
+            if len(ruby_parts) < count:
+                ruby_parts += [RubyPart(text=pause)] * (count - len(ruby_parts))
+            ruby_obj = Ruby(parts=ruby_parts) if ruby_parts else None
 
         character = Character(
             char=char_text,
@@ -924,6 +1010,7 @@ def _parse_plain_segment(
                             break
 
                     is_rest = text == REST_CHAR
+                    text = _unescape_inline_text(text)
                     first_n = pending_tags[0][0]
                     if first_n is not None:
                         check_count, is_line_end, is_sentence_end = decode_check_n(
@@ -986,7 +1073,7 @@ def _parse_plain_segment(
 
                 # 查看紧跟的文本字符
                 if pos < len(content) and content[pos] not in "[{":
-                    ch = content[pos]
+                    ch = _unescape_inline_text(content[pos])
                     pos += 1
 
                     check_count, is_line_end, is_sentence_end = decode_check_n(n_str)
@@ -1007,16 +1094,18 @@ def _parse_plain_segment(
                         last_char = characters[-1]
                         last_char.is_sentence_end = True
             else:
-                # 非 tag 文本 — 可能是无 CP 的空格或其他字符
-                ch = content[pos]
-                if ch in " \t":
-                    # 无 CP 的空格字符，直接添加（check_count=0）
-                    character = Character(
-                        char=ch,
-                        check_count=0,
-                        singer_id=singer_id,
-                    )
-                    characters.append(character)
+                # 非 tag 文本 — 裸字符（E7）：所有非 tag 字符都保留为
+                # 无 CP 字符，与导出侧 cc=0 输出对称。旧实现只保留
+                # 半角空格/Tab，"♪"、全角空格等全部丢失，整行无 tag 的
+                # 句子 round-trip 会变空句。裸 ▨ 还原为休止符。
+                ch = _unescape_inline_text(content[pos])
+                character = Character(
+                    char=ch,
+                    check_count=0,
+                    is_rest=(ch == REST_CHAR),
+                    singer_id=singer_id,
+                )
+                characters.append(character)
                 pos += 1
 
     if pending_tags:

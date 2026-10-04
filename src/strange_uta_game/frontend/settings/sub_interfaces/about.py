@@ -17,6 +17,7 @@ from qfluentwidgets import (
     SettingCard, SettingCardGroup,
 )
 
+from strange_uta_game import app_dirs
 from strange_uta_game.__version__ import __version__ as _app_version
 from strange_uta_game.frontend.localization import (
     AVAILABLE_LANGUAGES,
@@ -160,7 +161,7 @@ class AboutSubInterface(SubSettingInterface):
         # 隐藏整张「配置文件位置」卡片，并避免 setContent(str(None)) 显示 "None"。
         self._path_card.setVisible(not embedded)
         if not embedded:
-            self._path_card.setContent(str(s._config_path))
+            self._path_card.setContent(str(s.config_paths.config))
         self.tools_group.setVisible(not embedded)
         self.btn_import_ks.setVisible(not embedded)
         ffmpeg_path = s.get("tools.ffmpeg_path", "")
@@ -305,21 +306,25 @@ class AboutSubInterface(SubSettingInterface):
         QDesktopServices.openUrl(QUrl(self._github_url))
 
     def _open_config_dir(self):
-        if self._settings_ref is None or self._settings_ref._config_path is None:
+        cp = self._settings_ref.config_paths.config if self._settings_ref else None
+        if cp is None:
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._settings_ref._config_path.parent)))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(cp.parent)))
 
     def _change_config_dir(self):
-        if self._settings_ref is None or self._settings_ref._config_path is None:
+        cp = self._settings_ref.config_paths.config if self._settings_ref else None
+        if cp is None:
             return
         s = self._settings_ref
-        new_dir = QFileDialog.getExistingDirectory(self, self.tr("选择配置文件存储目录"), str(s._config_path.parent))
+        new_dir = QFileDialog.getExistingDirectory(self, self.tr("选择配置文件存储目录"), str(cp.parent))
         if not new_dir:
             return
 
         new_dir_path = Path(new_dir)
-        program_dir = Path(sys.argv[0]).resolve().parent
-        redirect_file = program_dir / ".config_redirect"
+        # 标记文件始终定位在程序目录（app_dirs.program_dir()），不依赖
+        # sys.argv[0]——后者在 pythonw/打包场景下不可靠。
+        redirect_file = app_dirs.redirect_marker_path()
+        program_dir = app_dirs.program_dir()
 
         if new_dir_path.resolve() == program_dir.resolve():
             try:
@@ -337,7 +342,7 @@ class AboutSubInterface(SubSettingInterface):
                     position=InfoBarPosition.TOP, duration=5000, parent=self)
                 return
 
-        old_path = s._config_path
+        old_path = cp
         new_path = new_dir_path / "config.json"
         if old_path.exists() and old_path != new_path:
             try:
@@ -355,15 +360,59 @@ class AboutSubInterface(SubSettingInterface):
                     orient=Qt.Orientation.Horizontal, isClosable=True,
                     position=InfoBarPosition.TOP, duration=5000, parent=self)
 
-        s._config_path = new_path
-        s._dict_path = new_dir_path / "dictionary.json"
-        s._network_dict_path = new_dir_path / "network_dictionary.json"
-        s._singers_path = new_dir_path / "singers.json"
+        # 原地切换存储路径并同步迁移共享实例缓存 key：之后 AppSettings()
+        # 仍命中同一实例，避免新旧两个共享实例内存态分裂、互相覆盖。
+        s.retarget_config_dir(new_dir_path)
+
+        # 迁移旧默认备份位置下的 .temp 闪退恢复文件（随 retarget 之后执行，
+        # 迁移失败记录才会写入新位置的 config.json）。
+        self._migrate_temp_files(old_path.parent, new_dir_path, s)
+
         self._path_card.setContent(str(new_path))
         InfoBar.success(title=self.tr("配置位置已更改"),
             content=self.tr("配置文件将保存到: {path}").format(path=new_path),
             orient=Qt.Orientation.Horizontal, isClosable=True,
             position=InfoBarPosition.TOP, duration=5000, parent=self)
+
+    @staticmethod
+    def _migrate_temp_files(old_config_dir: Path, new_config_dir: Path, s) -> None:
+        """把旧配置目录默认备份位置下的 .temp 闪退恢复文件搬到新位置。
+
+        备份位置默认跟随 config 目录（``<config_dir>/ProjectBackup/.temp``），
+        更改配置位置后旧位置会失联。搬移 + 记录双保险：没搬干净的旧目录
+        写入 ``auto_save.legacy_temp_dirs``，供闪退恢复扫描兜底
+        （见 ``ProjectStore._crash_recovery_dirs``）。
+        """
+        import shutil
+        old_temp = old_config_dir / "ProjectBackup" / ".temp"
+        if not old_temp.is_dir():
+            return
+        new_temp = new_config_dir / "ProjectBackup" / ".temp"
+        try:
+            if old_temp.resolve() == new_temp.resolve():
+                return
+        except OSError:
+            return
+        migrated_all = True
+        try:
+            new_temp.mkdir(parents=True, exist_ok=True)
+            for f in old_temp.glob(".*.sug.temp"):
+                try:
+                    shutil.move(str(f), str(new_temp / f.name))
+                except OSError:
+                    migrated_all = False
+        except OSError:
+            migrated_all = False
+        if not migrated_all:
+            try:
+                legacy = [str(p) for p in (s.get("auto_save.legacy_temp_dirs", []) or [])]
+                key = str(old_temp)
+                if key not in legacy:
+                    legacy.append(key)
+                    s.set("auto_save.legacy_temp_dirs", legacy)
+                    s.save()
+            except Exception:
+                pass
 
     def _update_ffmpeg_label(self, path: str):
         if path:

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import sys
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QColor, QPalette
@@ -344,7 +344,6 @@ class Theme(QObject):
         self._mode: ThemeMode = ThemeMode.AUTO
         self._colors: Optional[ThemeColors] = None
         self._system_is_dark: bool = False
-        self._listeners: List[Callable] = []
         self._poll_timer: Optional[QTimer] = None
         self._is_win10: bool = self._detect_windows_version()
         self._refreshing_widgets: bool = False
@@ -754,16 +753,6 @@ class Theme(QObject):
             child.style().polish(child)
             child.update()
 
-    def on_change(self, callback: Callable) -> None:
-        """注册主题变化回调"""
-        if callback not in self._listeners:
-            self._listeners.append(callback)
-
-    def off_change(self, callback: Callable) -> None:
-        """取消主题变化回调"""
-        if callback in self._listeners:
-            self._listeners.remove(callback)
-
     def refresh(self) -> None:
         """刷新主题（重新检测系统主题）"""
         self._detect_system_theme()
@@ -772,7 +761,7 @@ class Theme(QObject):
     def __getattr__(self, name: str):
         """代理 ThemeColors 的属性访问"""
         if name.startswith('_') or name in ('changed', 'mode', 'is_dark', 'colors',
-                                              'on_change', 'off_change', 'refresh',
+                                              'refresh',
                                               '_invalidate', '_apply_qfluentwidgets_theme',
                                               '_detect_system_theme', '_setup_system_theme_listener',
                                               '_on_system_theme_changed', '_apply_theme_change',

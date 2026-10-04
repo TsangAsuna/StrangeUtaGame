@@ -59,12 +59,15 @@ class ApplyAiTimingCommand(Command):
     # ── Command 协议 ──
 
     def execute(self) -> None:
-        self._validate_or_raise()
         if self._after_sentences is not None:
-            # 重做路径：恢复 execute 后的快照
+            # 重做路径：直接按 execute 后的快照恢复，跳过业务校验——
+            # 撤销后用户可能已改注音/结构，重跑 _validate_or_raise 必抛
+            # ProjectDriftError（重做条目永久丢失）；快照即执行时校验
+            # 通过的权威状态，恢复本身不需要再证明
             self._project.sentences = deepcopy(self._after_sentences)
             self._project._update_timestamp()
             return
+        self._validate_or_raise()
         self._before_sentences = deepcopy(self._project.sentences)
         self._apply()
         self._after_sentences = deepcopy(self._project.sentences)

@@ -881,3 +881,57 @@ class TestSeparationModelPredownload:
         cands = _github_mirror_candidates(sep_mod.SEPARATION_MODEL_URL)
         assert cands
         assert all("gh-proxy" in u and "github.com/TRvlvr" in u for u in cands)
+
+
+class TestScriptCleansInstrumental:
+    """G9：内置分离脚本必须清掉本次分离的非人声输出——output_dir 是
+    用户音乐目录，不删会在原曲旁留几十 MB 伴奏孤儿文件。"""
+
+    def _run_script(self, tmp_path, outputs, capsys, monkeypatch):
+        import sys
+        import types
+
+        out_dir = tmp_path / "music"
+        out_dir.mkdir()
+        inp = tmp_path / "song.flac"
+        inp.write_bytes(b"audio")
+        for name in outputs:
+            (out_dir / name).write_bytes(name.encode())
+
+        audio_sep = types.ModuleType("audio_separator")
+        sep_inner = types.ModuleType("audio_separator.separator")
+
+        class _FakeSeparator:
+            def __init__(self, model_file_dir=None, output_dir=None, output_format=None):
+                self.output_dir = output_dir
+
+            def load_model(self, model_filename):
+                pass
+
+            def separate(self, inp):
+                return list(outputs)
+
+        sep_inner.Separator = _FakeSeparator
+        monkeypatch.setitem(sys.modules, "audio_separator", audio_sep)
+        monkeypatch.setitem(sys.modules, "audio_separator.separator", sep_inner)
+        monkeypatch.setattr(
+            sys, "argv", ["script", str(inp), str(out_dir), str(tmp_path / "models")]
+        )
+        exec(_SCRIPT, {"__name__": "__main__"})
+        return out_dir
+
+    def test_instrumental_orphan_removed(self, tmp_path, capsys, monkeypatch):
+        outputs = ["song_Vocals_.wav", "song_Instrumental_.wav"]
+        out_dir = self._run_script(tmp_path, outputs, capsys, monkeypatch)
+        assert (out_dir / "song_人声.wav").is_file(), "人声轨应归一改名保留"
+        assert not (out_dir / "song_Instrumental_.wav").exists(), (
+            "伴奏孤儿文件必须被清理"
+        )
+        assert not (out_dir / "song_Vocals_.wav").exists(), "原人声文件应已移走"
+        assert "done:" in capsys.readouterr().out
+
+    def test_no_extra_outputs_leaves_nothing_behind(self, tmp_path, capsys, monkeypatch):
+        outputs = ["song_Vocals_.wav"]
+        out_dir = self._run_script(tmp_path, outputs, capsys, monkeypatch)
+        assert (out_dir / "song_人声.wav").is_file()
+        assert [p.name for p in out_dir.iterdir()] == ["song_人声.wav"]

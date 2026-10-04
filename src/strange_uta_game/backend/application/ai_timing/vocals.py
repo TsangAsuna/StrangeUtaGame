@@ -28,8 +28,10 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -49,7 +51,30 @@ class AiCacheError(RuntimeError):
     """AI 缓存操作错误（中文消息）。"""
 
 
+_SHA256_MEMO: "OrderedDict[tuple, str]" = OrderedDict()
+"""(路径, 大小, mtime_ns) → sha256 的 LRU 记忆化（G13）。"""
+
+_SHA256_MEMO_MAX = 32
+_sha256_memo_lock = threading.Lock()
+
+
 def sha256_of_path(path: Path) -> str:
+    """文件 sha256，按 ``(路径, 大小, mtime_ns)`` 记忆化。
+
+    弹窗每次刷新都会对整曲音频算指纹（快照 + 执行前各一遍），数百 MB
+    文件反复读盘明显拖慢 UI；同一 (大小, mtime) 视为内容未变直接命中。
+    缓存有界（LRU），文件被覆盖后 mtime/大小变化自动失效。
+    """
+    try:
+        st = path.stat()
+        memo_key = (str(path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        memo_key = None  # 不可 stat：按原逻辑交给 open 抛错
+    if memo_key is not None:
+        with _sha256_memo_lock:
+            cached = _SHA256_MEMO.get(memo_key)
+        if cached is not None:
+            return cached
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         while True:
@@ -57,7 +82,14 @@ def sha256_of_path(path: Path) -> str:
             if not chunk:
                 break
             digest.update(chunk)
-    return digest.hexdigest()
+    value = digest.hexdigest()
+    if memo_key is not None:
+        with _sha256_memo_lock:
+            _SHA256_MEMO[memo_key] = value
+            _SHA256_MEMO.move_to_end(memo_key)
+            while len(_SHA256_MEMO) > _SHA256_MEMO_MAX:
+                _SHA256_MEMO.popitem(last=False)
+    return value
 
 
 def cache_key(metadata: Dict[str, object]) -> str:

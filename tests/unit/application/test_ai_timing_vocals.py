@@ -15,6 +15,7 @@ from strange_uta_game.backend.application.ai_timing.vocals import (
     alignment_cache_metadata,
     cache_key,
     find_sibling_vocals,
+    sha256_of_path,
     vocal_cache_metadata,
 )
 
@@ -252,3 +253,34 @@ class TestVocalPreparation:
         )
         assert result.state == "cache"
         assert result.path == registered
+
+
+class TestSha256Memoization:
+    """G13：整曲音频指纹按 (路径, 大小, mtime) 记忆化——弹窗每次刷新
+    都会算两遍 sha256，数百 MB 文件重复读盘明显拖慢 UI。"""
+
+    def test_repeated_calls_cached(self, tmp_path):
+        import hashlib as _hl
+
+        f = tmp_path / "a.bin"
+        f.write_bytes(b"hello")
+        assert sha256_of_path(f) == _hl.sha256(b"hello").hexdigest()
+        # 第二次命中缓存（结果一致）
+        assert sha256_of_path(f) == _hl.sha256(b"hello").hexdigest()
+
+    def test_content_change_invalidates_cache(self, tmp_path):
+        import hashlib as _hl
+        import os as _os
+
+        f = tmp_path / "a.bin"
+        f.write_bytes(b"hello")
+        assert sha256_of_path(f) == _hl.sha256(b"hello").hexdigest()
+        # 内容变化且显式推进 mtime，确保 (大小, mtime) 键失效
+        f.write_bytes(b"world!")
+        st = f.stat()
+        _os.utime(f, ns=(st.st_atime_ns + 1_000_000, st.st_mtime_ns + 1_000_000))
+        assert sha256_of_path(f) == _hl.sha256(b"world!").hexdigest()
+
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(OSError):
+            sha256_of_path(tmp_path / "missing.bin")

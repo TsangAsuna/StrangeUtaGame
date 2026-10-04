@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from typing import Callable, List, Optional
 
 # ── 中文：拼音 → 表音（FA-Kara PINYIN_TO_PHONETIC 移植）──
@@ -177,6 +178,10 @@ def hangul_to_phonetic(text: str) -> str:
 
 # ── 英文：e2k 词典 → 片假名 → 按拍罗马字（SUG 自有数据）──
 
+_LAZY_INIT_LOCK = threading.Lock()
+"""惰性加载缓存的初始化锁（双线程同时触发加载只做一次；结果查询
+依赖 GIL 保证读写安全，无需全程持锁）。"""
+
 _E2K_LOOKUP_CACHE: Optional[Callable[[str], Optional[str]]] = None
 """惰性持有的 e2k 查询函数；测试可整体替换（封闭环境）。"""
 
@@ -191,18 +196,20 @@ def _e2k_lookup(word: str) -> Optional[str]:
     """e2k.txt 词表查询（EnglishRubyLookup 单例，首次调用加载）。"""
     global _E2K_LOOKUP_CACHE
     if _E2K_LOOKUP_CACHE is None:
-        try:
-            from strange_uta_game.backend.infrastructure.parsers.english_ruby import (
-                EnglishRubyLookup,
-            )
+        with _LAZY_INIT_LOCK:
+            if _E2K_LOOKUP_CACHE is None:
+                try:
+                    from strange_uta_game.backend.infrastructure.parsers.english_ruby import (
+                        EnglishRubyLookup,
+                    )
 
-            inst = EnglishRubyLookup.instance()
-            if inst.has():
-                _E2K_LOOKUP_CACHE = inst.lookup
-            else:
-                _E2K_LOOKUP_CACHE = lambda w: None
-        except Exception:
-            _E2K_LOOKUP_CACHE = lambda w: None
+                    inst = EnglishRubyLookup.instance()
+                    if inst.has():
+                        _E2K_LOOKUP_CACHE = inst.lookup
+                    else:
+                        _E2K_LOOKUP_CACHE = lambda w: None
+                except Exception:
+                    _E2K_LOOKUP_CACHE = lambda w: None
     return _E2K_LOOKUP_CACHE(word)
 
 
@@ -220,12 +227,14 @@ def _katakana_mora(text: str) -> List[str]:
 def _pyphen_dic():
     global _PYPhen_CACHE
     if _PYPhen_CACHE is None:
-        try:
-            import pyphen
+        with _LAZY_INIT_LOCK:
+            if _PYPhen_CACHE is None:
+                try:
+                    import pyphen
 
-            _PYPhen_CACHE = pyphen.Pyphen(lang="en_US")
-        except Exception:
-            _PYPhen_CACHE = False
+                    _PYPhen_CACHE = pyphen.Pyphen(lang="en_US")
+                except Exception:
+                    _PYPhen_CACHE = False
     return _PYPhen_CACHE or None
 
 
@@ -303,37 +312,40 @@ def _cmu_lookup(word: str) -> Optional[List[str]]:
     """cmudict-0.7b 查询（首选发音；文件缺失/解析失败返回 None）。"""
     global _CMU_LOOKUP_CACHE
     if _CMU_LOOKUP_CACHE is None:
-        table: dict = {}
+        with _LAZY_INIT_LOCK:
+            if _CMU_LOOKUP_CACHE is not None:
+                return _CMU_LOOKUP_CACHE(word)
+            table: dict = {}
 
-        def _load() -> Callable[[str], Optional[List[str]]]:
-            try:
-                from strange_uta_game.backend.infrastructure.parsers.e2k_engine import (
-                    EnglishToKanaEngine,
-                )
+            def _load() -> Callable[[str], Optional[List[str]]]:
+                try:
+                    from strange_uta_game.backend.infrastructure.parsers.e2k_engine import (
+                        EnglishToKanaEngine,
+                    )
 
-                path = EnglishToKanaEngine._resolve_cmudict_path()
-            except Exception:
-                return lambda w: None
-            if path is None:
-                return lambda w: None
-            try:
-                with open(path, "r", encoding="latin-1", errors="ignore") as f:
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) < 2:
-                            continue
-                        raw = parts[0]
-                        # 变体 WORD(2)/… 跳过，仅取首选发音
-                        if raw.endswith(")") and "(" in raw:
-                            continue
-                        if not raw or not raw[0].isalpha():
-                            continue
-                        table[raw.lower()] = parts[1:]
-            except Exception:
-                return lambda w: None
-            return table.get
+                    path = EnglishToKanaEngine._resolve_cmudict_path()
+                except Exception:
+                    return lambda w: None
+                if path is None:
+                    return lambda w: None
+                try:
+                    with open(path, "r", encoding="latin-1", errors="ignore") as f:
+                        for line in f:
+                            parts = line.split()
+                            if len(parts) < 2:
+                                continue
+                            raw = parts[0]
+                            # 变体 WORD(2)/… 跳过，仅取首选发音
+                            if raw.endswith(")") and "(" in raw:
+                                continue
+                            if not raw or not raw[0].isalpha():
+                                continue
+                            table[raw.lower()] = parts[1:]
+                except Exception:
+                    return lambda w: None
+                return table.get
 
-        _CMU_LOOKUP_CACHE = _load()
+            _CMU_LOOKUP_CACHE = _load()
     return _CMU_LOOKUP_CACHE(word)
 
 

@@ -73,3 +73,33 @@ class TestLoadLyricsFromFile:
         path = _write(tmp_path, "empty.lrc", "")
         sentences = ProjectImportService.load_lyrics_from_file(path, SINGER_ID)
         assert sentences == []
+
+
+class TestEncodingFallbackE1:
+    """E1：导入服务经 decode_lyric_bytes 走完整编码回退链，
+    不再用纯 utf-8 预读使回退失效。"""
+
+    def test_gbk_lrc_file(self, tmp_path: Path):
+        p = tmp_path / "song.lrc"
+        p.write_bytes("[00:01.00]从此我不能\n[00:02.00]听见你的温柔\n".encode("gbk"))
+
+        sentences = ProjectImportService.load_lyrics_from_file(str(p), SINGER_ID)
+
+        assert [s.text for s in sentences] == ["从此我不能", "听见你的温柔"]
+        assert all(s.singer_id == SINGER_ID for s in sentences)
+
+    def test_utf16_lrc_file(self, tmp_path: Path):
+        p = tmp_path / "song.lrc"
+        p.write_bytes("[00:01.00]あ\n".encode("utf-16"))
+
+        sentences = ProjectImportService.load_lyrics_from_file(str(p), SINGER_ID)
+
+        assert len(sentences) == 1
+        assert sentences[0].text == "あ"
+
+    def test_undecodable_file_raises_project_import_error(self, tmp_path: Path):
+        p = tmp_path / "song.lrc"
+        p.write_bytes(b"\x81\x00\x81\x01")
+
+        with pytest.raises(ProjectImportError):
+            ProjectImportService.load_lyrics_from_file(str(p), SINGER_ID)

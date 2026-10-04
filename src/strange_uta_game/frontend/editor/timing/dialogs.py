@@ -274,6 +274,39 @@ def parse_ruby_text(
     return Ruby(parts=[RubyPart(text=p) for p in parts])
 
 
+def apply_linked_with_validation(
+    chars: list,
+    linked_req: list,
+    start_abs_idx: int,
+    total_after: int,
+    failures: list,
+) -> None:
+    """按用户请求应用向后连词，并统一校验末字/行尾禁止连词。
+
+    ModifyCharacterDialog / CharEditDialog 共用同一口径：末字或行尾字符
+    的连词请求被跳过（linked_to_next 强制 False），并记入 failures
+    （(abs_idx, char, reason) 列表，由调用方弹窗汇总）。
+    停顿点（is_sentence_end）= 语气停顿点，允许连词。
+
+    Args:
+        chars: 目标字符序列（原地写 linked_to_next）
+        linked_req: 与 chars 对齐的用户连词请求
+        start_abs_idx: 首字符在句中的绝对索引
+        total_after: 应用后句子总字符数（用于判定末字）
+        failures: 连词失败项收集列表
+    """
+    for i, ch in enumerate(chars):
+        req_linked = bool(linked_req[i]) if i < len(linked_req) else False
+        abs_idx = start_abs_idx + i
+        is_last_in_sentence = abs_idx >= total_after - 1
+        if req_linked and (is_last_in_sentence or ch.is_line_end):
+            reason = "最后一个字符" if is_last_in_sentence else "行尾"
+            failures.append((abs_idx, ch.char, reason))
+            ch.linked_to_next = False
+        else:
+            ch.linked_to_next = req_linked
+
+
 class ModifyCharacterDialog(QDialog):
     """修改所选字符对话框 — 替换选中区间的文本、注音、节奏点、连词。
 
@@ -540,8 +573,10 @@ class ModifyCharacterDialog(QDialog):
     def _on_execute(self):
         from strange_uta_game.backend.domain.models import Character
 
-        new_text = self.edit_new_chars.text().strip()
-        if not new_text:
+        # 写回保留原文：.strip() 会吞掉有义空格，且把同长度原地改
+        # 误判成换长度（长度比较用未 strip 文本）
+        new_text = self.edit_new_chars.text()
+        if not new_text.strip():
             return
 
         # 收集每行值：ruby / check_count / linked_to_next
@@ -579,20 +614,11 @@ class ModifyCharacterDialog(QDialog):
                 tgt.set_ruby(per_char_ruby[i])
                 tgt.set_check_count(per_char_check[i], force=True)
                 tgt.push_to_ruby()
-                # linked_to_next 校验：末字/行尾禁止连词（停顿点=语气停顿点，可以连词）
-                req_linked = per_char_linked_req[i]
-                abs_idx = self._start_idx + i
-                sentence_len = len(self._sentence.characters)
-                is_last_in_sentence = abs_idx >= sentence_len - 1
-                if req_linked and (
-                    is_last_in_sentence
-                    or tgt.is_line_end
-                ):
-                    reason = "最后一个字符" if is_last_in_sentence else "行尾"
-                    self._linked_failures.append((abs_idx, ch_str, reason))
-                    tgt.linked_to_next = False
-                else:
-                    tgt.linked_to_next = req_linked
+            # linked_to_next 校验：末字/行尾禁止连词（停顿点=语气停顿点，可以连词）
+            apply_linked_with_validation(
+                old_chars, per_char_linked_req, self._start_idx,
+                len(self._sentence.characters), self._linked_failures,
+            )
             # 停顿点 / 行末由原字符保留，不动 is_sentence_end / is_line_end
         else:
             # 字符数变化 → 替换 slice（无法保留 timestamps）
@@ -616,19 +642,10 @@ class ModifyCharacterDialog(QDialog):
             total_after = (
                 len(self._sentence.characters) - len(old_chars) + len(new_chars)
             )
-            for i, new_ch in enumerate(new_chars):
-                req_linked = per_char_linked_req[i]
-                abs_idx = self._start_idx + i
-                is_last_in_sentence = abs_idx >= total_after - 1
-                if req_linked and (
-                    is_last_in_sentence
-                    or new_ch.is_line_end
-                ):
-                    reason = "最后一个字符" if is_last_in_sentence else "行尾"
-                    self._linked_failures.append((abs_idx, new_ch.char, reason))
-                    new_ch.linked_to_next = False
-                else:
-                    new_ch.linked_to_next = req_linked
+            apply_linked_with_validation(
+                new_chars, per_char_linked_req, self._start_idx,
+                total_after, self._linked_failures,
+            )
             self._sentence.characters[self._start_idx : self._end_idx + 1] = new_chars
 
         # 词典注册：传 Ruby 对象列表 + 连词信息，完整保留用户设定
@@ -1048,6 +1065,7 @@ class CharEditDialog(QDialog):
         self._char_idx = char_idx
         self._modified = False
         self._switch_to_bulk = False
+        self._linked_failures: list[tuple[int, str, str]] = []
         self._char_rows: list[tuple[QLabel, QLineEdit, QLineEdit, QCheckBox]] = []
 
         self.setWindowTitle(self.tr("编辑字符"))
@@ -1301,10 +1319,11 @@ class CharEditDialog(QDialog):
         self.preview_label.setText(self.tr("预览: {items}").format(items=' '.join(preview_items)))
 
     def _on_accept(self):
-        new_text = self.edit_new_chars.text().strip()
-        word_len = self._word_end - self._word_start
+        # 写回保留原文：.strip() 会吞掉有义空格，且把同长度原地改
+        # 误判成换长度（长度比较用未 strip 文本）
+        new_text = self.edit_new_chars.text()
 
-        if not new_text:
+        if not new_text.strip():
             self.accept()
             return
 
@@ -1335,6 +1354,10 @@ class CharEditDialog(QDialog):
 
         # 应用到当前连词组
         old_chars = [self._sentence.characters[i] for i in range(self._word_start, self._word_end)]
+        old_last_is_sentence_end = old_chars[-1].is_sentence_end if old_chars else False
+        old_last_is_line_end = old_chars[-1].is_line_end if old_chars else False
+
+        self._linked_failures = []
 
         if len(new_text) == len(old_chars):
             # 字符数不变 → 原地修改
@@ -1344,7 +1367,11 @@ class CharEditDialog(QDialog):
                 tgt.set_ruby(per_char_ruby[i])
                 tgt.set_check_count(per_char_check[i], force=True)
                 tgt.push_to_ruby()
-                tgt.linked_to_next = per_char_linked_req[i]
+            # 连词校验与 ModifyCharacterDialog 同口径：末字/行尾禁止连词
+            apply_linked_with_validation(
+                old_chars, per_char_linked_req, self._word_start,
+                len(self._sentence.characters), self._linked_failures,
+            )
         else:
             # 字符数变化 → 替换 slice
             singer_id = old_chars[0].singer_id if old_chars else ""
@@ -1360,6 +1387,19 @@ class CharEditDialog(QDialog):
                     is_sentence_end=False,
                 )
                 new_chars.append(new_ch)
+            # 行末 / 停顿点标志回填到新末字（换长度丢时间戳，但语义标志必须保留）
+            if old_last_is_sentence_end and new_chars:
+                new_chars[-1].is_sentence_end = True
+            if old_last_is_line_end and new_chars:
+                new_chars[-1].is_line_end = True
+            # 连词按用户勾选应用 + 末字/行尾校验（与 ModifyCharacterDialog 同口径）
+            total_after = (
+                len(self._sentence.characters) - len(old_chars) + len(new_chars)
+            )
+            apply_linked_with_validation(
+                new_chars, per_char_linked_req, self._word_start,
+                total_after, self._linked_failures,
+            )
             self._sentence.characters[self._word_start:self._word_end] = new_chars
 
         self._modified = True
@@ -1375,6 +1415,10 @@ class CharEditDialog(QDialog):
 
     def was_modified(self) -> bool:
         return self._modified
+
+    def get_linked_failures(self) -> list[tuple[int, str, str]]:
+        """返回应用连词时因末字/行尾被跳过的项列表（abs_idx, char, reason）。"""
+        return list(self._linked_failures)
 
     def _register_to_dictionary(self, word: str, per_char_ruby: list, per_char_linked: list | None = None):
         """将词注册到用户词典，完整保留用户设定的 Ruby parts（mora）与连词信息。"""
@@ -1415,6 +1459,8 @@ class SetSingerByLineDialog(QDialog):
         self._singers = singers
         self._modified = False
         self._focus_line_idx = focus_line_idx
+        # 历次「应用」累计的 {line_idx: singer_id}，result_map() 读取
+        self._result_map: dict[int, str] = {}
 
         # 构建 singer_id -> Singer 映射
         self._singer_map = {s.id: s for s in singers}
@@ -1673,6 +1719,8 @@ class SetSingerByLineDialog(QDialog):
 
         # 构建结果映射并发出信号
         result_map = {line_idx: singer_id for line_idx in selected_lines}
+        # 累计保存（对话框不关闭、可多次应用），供 result_map() 查询
+        self._result_map.update(result_map)
         self._modified = True
         self.apply_requested.emit(result_map)
 

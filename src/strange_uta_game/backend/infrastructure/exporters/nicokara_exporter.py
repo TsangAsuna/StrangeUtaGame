@@ -124,7 +124,6 @@ class NicokaraExporter(BaseExporter):
         self._validate_project(project)
 
         output_lines: List[str] = []
-        prev_end_ms = 0
         prev_singer_id: Optional[str] = None
         default_singer_id = self._get_default_singer_id(project)
         known_singer_ids: Set[str] = {s.id for s in project.singers}
@@ -175,11 +174,6 @@ class NicokaraExporter(BaseExporter):
             ):
                 continue
             output_lines.append(line_text)
-
-            if sentence.has_timetags:
-                end_ms = sentence.timing_end_ms
-                if end_ms is not None:
-                    prev_end_ms = end_ms
 
             # 空行后重置 prev_singer_id 规则已废弃：
             # 实际 n3_color 数据显示，空行后若 singer 未变更，则不重复插入
@@ -475,9 +469,10 @@ class NicokaraWithRubyExporter(NicokaraExporter):
         self._validate_project(project)
 
         output_lines: List[str] = []
-        prev_end_ms = 0
         prev_singer_id: Optional[str] = None
         default_singer_id = self._get_default_singer_id(project)
+        # 与基础版同口径：未知/不存在的演唱者 ID 归一化为默认演唱者
+        known_singer_ids: Set[str] = {s.id for s in project.singers}
 
         for i, sentence in enumerate(project.sentences):
             # 空行（用户排版意图）无条件保留：
@@ -493,7 +488,7 @@ class NicokaraWithRubyExporter(NicokaraExporter):
             # 演唱者过滤
             if singer_ids is not None and not is_blank_line:
                 if not self._sentence_has_singer(
-                    sentence, singer_ids, default_singer_id
+                    sentence, singer_ids, default_singer_id, known_singer_ids
                 ):
                     continue
 
@@ -509,6 +504,7 @@ class NicokaraWithRubyExporter(NicokaraExporter):
                 singer_map,
                 effective_prev,
                 default_singer_id,
+                known_singer_ids,
             )
             # 空行（只有空格、无时间戳）统一输出为真正的空行
             if is_blank_line:
@@ -523,11 +519,6 @@ class NicokaraWithRubyExporter(NicokaraExporter):
             ):
                 continue
             output_lines.append(line_text)
-
-            if sentence.has_timetags:
-                end_ms = sentence.timing_end_ms
-                if end_ms is not None:
-                    prev_end_ms = end_ms
 
             # 空行后重置 prev_singer_id 规则已废弃：
             # 实际 n3_color 数据显示，空行后若 singer 未变更，则不重复插入
@@ -583,7 +574,9 @@ class NicokaraWithRubyExporter(NicokaraExporter):
                 output_lines.append(custom)
 
         # @Ruby 注音标签（也按演唱者过滤）
-        ruby_entries = self._collect_ruby_entries(project, singer_ids)
+        ruby_entries = self._collect_ruby_entries(
+            project, singer_ids, known_singer_ids
+        )
         for idx, entry in enumerate(ruby_entries, 1):
             output_lines.append(f"@Ruby{idx}={entry}")
 
@@ -621,7 +614,10 @@ class NicokaraWithRubyExporter(NicokaraExporter):
     # ------------------------------------------------------------------
 
     def _collect_ruby_entries(
-        self, project: Project, singer_ids: Optional[Set[str]] = None
+        self,
+        project: Project,
+        singer_ids: Optional[Set[str]] = None,
+        known_singer_ids: Optional[Set[str]] = None,
     ) -> List[str]:
         """收集所有注音并生成 @Ruby 条目列表（按 linked_to_next 切段）
 
@@ -640,6 +636,10 @@ class NicokaraWithRubyExporter(NicokaraExporter):
           - 相邻两个有 ruby 但未设为连词的字符（典型：解析后的两个
             单字 @Ruby tag）必须输出为两个独立 `@RubyN` entry。
           - 每段独立输出，N 严格递增，不复用、不去重、不按 kanji 合并。
+          - 演唱者过滤与 `_export_sentence_with_singer` 同口径，按
+            **per-char** 的 effective_singer 判定：被过滤角色的字与
+            注音不得进入任何 @Ruby 段（对唱拆分导出时否则会泄漏
+            对方注音，播放器注入错乱）；整段全被过滤则不输出条目。
           - 作用域按**文本顺序在本行内优先闭段**：
               pos1 = 段首字第一个 global timestamp（缺失则向上回溯；
                     跨行回退时钳制不超过本行内其后的第一个 ts）
@@ -652,6 +652,8 @@ class NicokaraWithRubyExporter(NicokaraExporter):
         Args:
             project: 项目数据
             singer_ids: 要输出的演唱者 ID 集合（None 表示全部）
+            known_singer_ids: 项目中真实存在的演唱者 ID 集合，
+                用于把未知 ID 归一化为默认演唱者（与正文导出同口径）
 
         Returns:
             格式: ["漢字,読み[ts],pos1,pos2", ...]，调用方加 @RubyN= 前缀
@@ -662,12 +664,23 @@ class NicokaraWithRubyExporter(NicokaraExporter):
         for sent_idx, sentence in enumerate(project.sentences):
             if singer_ids is not None:
                 if not self._sentence_has_singer(
-                    sentence, singer_ids, default_singer_id
+                    sentence, singer_ids, default_singer_id, known_singer_ids
                 ):
                     continue
 
             chars = sentence.characters
             n = len(chars)
+            # per-char 演唱者过滤标记（与正文导出同一归一化口径）
+            char_exported: List[bool] = [
+                singer_ids is None
+                or self._normalize_singer_id(
+                    ch.singer_id or sentence.singer_id,
+                    default_singer_id,
+                    known_singer_ids,
+                )
+                in singer_ids
+                for ch in chars
+            ]
             i = 0
             while i < n:
                 if chars[i].ruby is None:
@@ -697,17 +710,31 @@ class NicokaraWithRubyExporter(NicokaraExporter):
                     i += 1
                 end_idx = i
 
-                kanji = "".join(c.char for c in chars[start_idx:end_idx])
+                # 演唱者过滤：只保留属于选定演唱者的字符（同口径于正文导出）
+                group_chars = [
+                    c
+                    for c, exported in zip(
+                        chars[start_idx:end_idx],
+                        char_exported[start_idx:end_idx],
+                    )
+                    if exported
+                ]
+                if not group_chars:
+                    # 整段均属被过滤演唱者：不输出该 @Ruby 条目
+                    continue
+
+                kanji = "".join(c.char for c in group_chars)
                 kanji = strip_variation_selectors(kanji)
                 reading_fallback = "".join(
-                    p.text
-                    for c in chars[start_idx:end_idx]
-                    if c.ruby
-                    for p in c.ruby.parts
+                    p.text for c in group_chars if c.ruby for p in c.ruby.parts
                 )
                 reading_display, _ = self._build_reading_with_timestamps(
-                    sentence, start_idx, end_idx, reading_fallback
+                    sentence, start_idx, end_idx, reading_fallback,
+                    exported=char_exported,
                 )
+                if singer_ids is not None and not reading_display:
+                    # 本段可输出的读音为空（注音全在被过滤角色上）
+                    continue
 
                 # pos1: 段首字第一个 global ts；若段首字无 ts（linked group 头字 如 死/高），
                 # 严格向上就近找：先在本句段前 char 找最近 ts，再跨 sentence 向上找。
@@ -830,6 +857,7 @@ class NicokaraWithRubyExporter(NicokaraExporter):
         start_idx: int,
         end_idx: int,
         reading: str,
+        exported: Optional[List[bool]] = None,
     ) -> tuple[str, tuple]:
         """构建带相对时间戳的读音文本
 
@@ -841,6 +869,8 @@ class NicokaraWithRubyExporter(NicokaraExporter):
             start_idx: ruby 起始字符索引
             end_idx:   ruby 结束字符索引
             reading:   读音文本
+            exported:  可选的 per-char 演唱者过滤标记（与收集方同长度）；
+                       为 False 的字符不贡献读音 / checkpoint
 
         Returns:
             (display_str, ms_key)
@@ -853,6 +883,9 @@ class NicokaraWithRubyExporter(NicokaraExporter):
         for char_idx in range(start_idx, end_idx):
             if char_idx >= len(sentence.characters):
                 break
+            if exported is not None and not exported[char_idx]:
+                # 被演唱者过滤掉的字符：不贡献 reading / checkpoint
+                continue
             ch = sentence.characters[char_idx]
             ruby = ch.ruby
             if ruby is None:
@@ -902,8 +935,13 @@ class NicokaraWithRubyExporter(NicokaraExporter):
                 ch = sentence.characters[char_idx]
                 if cp_idx < len(ch.global_timestamps):
                     relative_ms = ch.global_timestamps[cp_idx] - group_start_ms
-                    display_parts.append(_format_nicokara_ts(relative_ms))
-                    ms_key_parts.append(relative_ms)
+                    if relative_ms >= 0:
+                        display_parts.append(_format_nicokara_ts(relative_ms))
+                        ms_key_parts.append(relative_ms)
+                    # 负相对时间戳只可能是乱序脏数据（后拍早于组首拍）。
+                    # Nicokara 格式无法表达负值，钳 0 会伪造 [00:00:00]
+                    # 让走字停滞在该假名上；与「无时间戳 part」同口径，
+                    # 直接省略该相对时间戳。
 
             display_parts.append(group_text)
             ms_key_parts.append(group_text)

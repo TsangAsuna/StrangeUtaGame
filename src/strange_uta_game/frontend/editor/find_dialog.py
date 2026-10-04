@@ -170,10 +170,16 @@ class FindDialog(QDialog):
         self._btn_replace.clicked.connect(self._on_replace)
         self._btn_replace_all.clicked.connect(self._on_replace_all)
         self._switch_filter.checkedChanged.connect(self._on_filter_changed)
-        self._text_edit.textChanged.connect(lambda: self._debounce_search())
+        # 连接具名槽而非 lambda：closeEvent 需要断开这条连接，
+        # 否则对话框关闭后（对象仍挂在父窗口下）每次编辑都会
+        # 重跑搜索并复活已清掉的高亮。
+        self._text_edit.textChanged.connect(self._on_text_edit_changed)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.timeout.connect(self._on_search)
+
+    def _on_text_edit_changed(self):
+        self._debounce_search()
 
     def _debounce_search(self):
         self._debounce_timer.stop()
@@ -471,5 +477,12 @@ class FindDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        # 断开对编辑器的监听并停掉防抖定时器：对话框关闭后对象仍以父窗口
+        # 存活，残留连接会让每次编辑重跑搜索、把已清掉的高亮"复活"。
+        try:
+            self._text_edit.textChanged.disconnect(self._on_text_edit_changed)
+        except TypeError:
+            pass  # 未连接（重复关闭等）时忽略
+        self._debounce_timer.stop()
         self._clear_highlights()
         super().closeEvent(event)

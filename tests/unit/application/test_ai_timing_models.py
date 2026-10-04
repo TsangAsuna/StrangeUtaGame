@@ -47,8 +47,11 @@ class _FakeTransport:
         return sorted((name, len(data)) for name, data in self.files.items())
 
     def download_file(
-        self, repo_id, revision, filename, dest, *, expected_size, progress, cancel
+        self, repo_id, revision, filename, dest, *, expected_size, progress, cancel,
+        expected_sha256=None,
     ):
+        self.received_sha = getattr(self, "received_sha", {})
+        self.received_sha[filename] = expected_sha256
         if filename in self.fail_on:
             raise ModelRegistryError(f"下载 {filename} 失败：模拟网络中断")
         if cancel():
@@ -816,6 +819,91 @@ class TestStreamingTransport:
         finally:
             server.shutdown()
 
+    def test_resume_with_known_sha_and_matching_prefix(self, tmp_path):
+        """G6：给出远端 sha256 且 .part 前缀与远端一致 → 正常续传。"""
+        import hashlib
+
+        from strange_uta_game.backend.application.ai_timing.models import (
+            HfHubTransport,
+        )
+
+        server, url = self._serve(tmp_path)
+        try:
+            transport = HfHubTransport(endpoint=url.rsplit("/", 1)[0])
+            dest = tmp_path / "out" / "blob.bin"
+            part = dest.with_name(dest.name + ".part")
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(b"x" * 100_000)
+            transport.download_file(
+                "repo",
+                "rev",
+                "blob.bin",
+                dest,
+                expected_size=300_000,
+                progress=lambda p, m: None,
+                cancel=lambda: False,
+                expected_sha256=hashlib.sha256(b"x" * 300_000).hexdigest(),
+            )
+            assert dest.read_bytes() == b"x" * 300_000
+        finally:
+            server.shutdown()
+
+    def test_resume_prefix_mismatch_discards_part(self, tmp_path):
+        """G6：.part 前缀与远端不符（旧版本残留）→ 丢弃断点重下，
+        否则拼接出 Z…Z + x…x 的损坏文件。"""
+        import hashlib
+
+        from strange_uta_game.backend.application.ai_timing.models import (
+            HfHubTransport,
+        )
+
+        server, url = self._serve(tmp_path)
+        try:
+            transport = HfHubTransport(endpoint=url.rsplit("/", 1)[0])
+            dest = tmp_path / "out" / "blob.bin"
+            part = dest.with_name(dest.name + ".part")
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(b"Z" * 100_000)
+            transport.download_file(
+                "repo",
+                "rev",
+                "blob.bin",
+                dest,
+                expected_size=300_000,
+                progress=lambda p, m: None,
+                cancel=lambda: False,
+                expected_sha256=hashlib.sha256(b"x" * 300_000).hexdigest(),
+            )
+            assert dest.read_bytes() == b"x" * 300_000
+        finally:
+            server.shutdown()
+
+    def test_resume_oversized_part_discarded(self, tmp_path):
+        """G6：.part 比目标文件还大 → 不是本文件的断点，丢弃重下。"""
+        from strange_uta_game.backend.application.ai_timing.models import (
+            HfHubTransport,
+        )
+
+        server, url = self._serve(tmp_path)
+        try:
+            transport = HfHubTransport(endpoint=url.rsplit("/", 1)[0])
+            dest = tmp_path / "out" / "blob.bin"
+            part = dest.with_name(dest.name + ".part")
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(b"Z" * 500_000)
+            transport.download_file(
+                "repo",
+                "rev",
+                "blob.bin",
+                dest,
+                expected_size=300_000,
+                progress=lambda p, m: None,
+                cancel=lambda: False,
+            )
+            assert dest.read_bytes() == b"x" * 300_000
+        finally:
+            server.shutdown()
+
 
 class TestSharedRuntimeInstall:
     """方案 B：向宿主托管 Runtime 增量安装（不建 venv、不装 torch）。"""
@@ -1442,3 +1530,88 @@ class TestFrozenInterpreterGuards:
             assert "startupinfo" in kw
         else:
             assert kw == {}
+
+
+class TestRemoteSha256Verification:
+    """G6：模型完整性以远端 LFS oid 为准——manifest 只存自算哈希会让
+    损坏权重「自证」校验通过。"""
+
+    def _transport_with_oids(self, files, oids):
+        class _OidTransport(_FakeTransport):
+            def list_files(self, repo_id, revision):
+                return sorted(
+                    (name, len(data), oids.get(name))
+                    for name, data in files.items()
+                )
+
+        return _OidTransport(files=files)
+
+    def test_matching_remote_sha_registers_manifest(self, tmp_path):
+        import hashlib as _hl
+
+        files = _hf_files()
+        oids = {
+            name: _hl.sha256(data).hexdigest() for name, data in files.items()
+        }
+        registry = ModelRegistry(tmp_path)
+        transport = self._transport_with_oids(files, oids)
+        service = ModelDownloadService(registry, transport)
+        target = service.download("NextFire/demo", "wav2vec2")
+        manifest = registry.read_manifest("NextFire/demo")
+        by_name = {f.filename: f for f in manifest.files}
+        assert by_name["model.safetensors"].sha256 == oids["model.safetensors"]
+        assert registry.validate("NextFire/demo").state == "ok"
+        assert target.is_dir()
+
+    def test_sha_mismatch_rejects_and_keeps_unregistered(self, tmp_path):
+        import hashlib as _hl
+
+        files = _hf_files()
+        oids = {
+            name: _hl.sha256(data).hexdigest() for name, data in files.items()
+        }
+        # 远端 oid 与实际内容不符（被篡改/损坏的下载源）
+        oids["model.safetensors"] = "f" * 64
+
+        registry = ModelRegistry(tmp_path)
+        transport = self._transport_with_oids(files, oids)
+        service = ModelDownloadService(registry, transport)
+        with pytest.raises(ModelRegistryError, match="完整性校验失败"):
+            service.download("NextFire/demo", "wav2vec2")
+        # manifest 不落盘 + 坏文件被删除，下次重下而不是复用
+        assert not (registry.model_dir("NextFire/demo") / MANIFEST_NAME).exists()
+        assert not (registry.model_dir("NextFire/demo") / "model.safetensors").exists()
+
+    def test_reused_corrupt_file_with_known_oid_rejected(self, tmp_path):
+        import hashlib as _hl
+
+        files = _hf_files()
+        oids = {
+            name: _hl.sha256(data).hexdigest() for name, data in files.items()
+        }
+        registry = ModelRegistry(tmp_path)
+        target = registry.model_dir("NextFire/demo")
+        target.mkdir(parents=True)
+        # 大小正确但内容损坏的「已下载」文件（与正确内容等长、内容不同）
+        corrupt = b"X" * len(files["model.safetensors"])
+        assert corrupt != files["model.safetensors"]
+        (target / "model.safetensors").write_bytes(corrupt)
+        transport = self._transport_with_oids(files, oids)
+        service = ModelDownloadService(registry, transport)
+        with pytest.raises(ModelRegistryError, match="完整性校验失败"):
+            service.download("NextFire/demo", "wav2vec2")
+        assert not (target / "model.safetensors").exists()
+
+    def test_filter_model_files_passthrough_sha_entries(self):
+        files = [
+            ("model.safetensors", 13, "a" * 64),
+            ("tf_model.h5", 9, "b" * 64),
+            ("config.json", 26),
+        ]
+        filtered = filter_model_files(files)
+        # 过滤保持原顺序与原形态（三元组原样透传，二元组不受影响）
+        assert [item[0] for item in filtered] == [
+            "model.safetensors",
+            "config.json",
+        ]
+        assert ("model.safetensors", 13, "a" * 64) in filtered

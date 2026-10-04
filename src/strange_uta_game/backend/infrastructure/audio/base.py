@@ -239,3 +239,19 @@ class IAudioEngine(ABC):
         在不再需要音频引擎时调用，释放相关资源。
         """
         pass
+
+    def set_device_recovered_callback(
+        self, callback: Optional[Callable[[], None]]
+    ) -> None:
+        """注册设备恢复回调（可选能力，默认空实现）。
+
+        BASS 类引擎在设备丢失恢复时会 ``BASS_Free()`` 重建整个 BASS 会话：
+        进程内所有 BASS sample 句柄（按键音/节拍器）随之全部失效。恢复流程
+        完成后引擎调用本回调，UI 层应在收到后对 keysound/metronome 执行
+        ``invalidate()`` 并重新 ``load()`` 样本。
+
+        **线程约定**：回调在引擎的恢复线程/轮询线程上执行，严禁在其中直接
+        操作 Qt 对象——UI 层需经信号或线程安全队列 marshal 回主线程。
+        传 None 注销。
+        """
+        return None

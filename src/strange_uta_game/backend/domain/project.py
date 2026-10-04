@@ -146,7 +146,17 @@ class Project:
         if not singer:
             raise DomainError(f"演唱者 {singer_id} 不存在")
 
+        # 默认演唱者保护：删除后项目必须仍持有默认演唱者，否则 validate()
+        # 必然报错。调用方须先把其他演唱者设为默认（如导入预设流程的
+        # 先设新默认再删占位符）。
+        if singer.is_default and not any(
+            s.is_default and s.id != singer_id for s in self.singers
+        ):
+            raise ValidationError("不能删除默认演唱者，请先将其他演唱者设为默认")
+
         if transfer_to:
+            if transfer_to == singer_id:
+                raise ValidationError("转移目标不能是被删除的演唱者自身")
             target = self.get_singer(transfer_to)
             if not target:
                 raise DomainError(f"目标演唱者 {transfer_to} 不存在")
@@ -299,7 +309,9 @@ class Project:
                     self.sentences.insert(i + 1, sentence)
                     break
             else:
-                self.sentences.append(sentence)
+                # 参考句不存在时不静默追加到末尾——那会把插入语义悄悄变成
+                # 追加语义，调用方应修正传入的 after_sentence_id。
+                raise DomainError(f"参考句子 {after_sentence_id} 不存在")
         else:
             self.sentences.append(sentence)
 
@@ -347,7 +359,8 @@ class Project:
         return self.get_sentences_by_singer(singer_id)
 
     def move_sentence(self, sentence_id: str, new_position: int) -> None:
-        """移动句子到指定位置"""
+        """移动句子到指定位置（落点 = 目标槽位，即被移动句占据
+        ``new_position`` 处原句子的位置，原句后移/前移让位）。"""
         sentence = self.get_sentence(sentence_id)
         if not sentence:
             raise DomainError(f"句子 {sentence_id} 不存在")
@@ -355,8 +368,17 @@ class Project:
         if new_position < 0 or new_position >= len(self.sentences):
             raise ValidationError(f"位置 {new_position} 超出范围")
 
-        self.sentences = [s for s in self.sentences if s.id != sentence_id]
-        self.sentences.insert(new_position, sentence)
+        old_position = self.sentences.index(sentence)
+        if old_position == new_position:
+            return
+
+        self.sentences.pop(old_position)
+        # 向前移动（目标位大于原位）时，移除元素使后续索引整体左移一位，
+        # 需补偿 -1 才能落到目标槽位，与向后移动语义一致。
+        insert_position = (
+            new_position if new_position < old_position else new_position - 1
+        )
+        self.sentences.insert(insert_position, sentence)
         self._update_timestamp()
 
     def merge_line_into_previous(self, line_idx: int) -> bool:
@@ -758,8 +780,12 @@ class Project:
             return True
 
         char = sentence.characters[char_pos]
-        # 仍有效：在 [0, check_count) 区间内
+        # 仍有效：在 [0, check_count) 区间内，或为句尾停顿点 cp
+        #（is_sentence_end 字符的虚拟 cp，索引 = check_count，见
+        # Character.is_sentence_end_tail_cp）
         if char.check_count > 0 and 0 <= cp_idx < char.check_count:
+            return False
+        if char.is_sentence_end and cp_idx == char.check_count:
             return False
 
         # 同字截断

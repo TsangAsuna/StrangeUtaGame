@@ -78,6 +78,14 @@ def get_char_type(char: str) -> CharType:
     if "\uac00" <= char <= "\ud7a3":
         return CharType.HANGUL
 
+    # 半角片假名字母（U+FF66–U+FF9F，ｦｧｨ…ﾝﾞﾟ）。isalpha() 对它们返回
+    # True，不拦截会被下方兜底误归 ALPHABET → 语言误判/romaji 漏判（E11，
+    # 昭和系歌词常见）。注意 U+FF61–FF65（｡｢｣､･）是半角标点，仍交给
+    # 下方 Unicode 分类兜底归 SYMBOL（与全角中点 U+30FB 同语义）；
+    # 半角长音 ｰ U+FF70 已在上方特判为长音。
+    if "\uff66" <= char <= "\uff9f":
+        return CharType.KATAKANA
+
     # 英文字母
     if char.isalpha():
         return CharType.ALPHABET

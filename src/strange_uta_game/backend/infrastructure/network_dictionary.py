@@ -28,6 +28,7 @@ Public API
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import time
 import urllib.error
@@ -39,6 +40,8 @@ from strange_uta_game.backend.infrastructure.parsers.rl_dictionary import (
     read_rl_dictionary_file,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ──────────────────────────────────────────────
 # 内置预设 & 默认文档
@@ -49,7 +52,10 @@ BUILTIN_SOURCES: List[Dict[str, Any]] = [
     {
         "id": "rl_official",
         "name": "RhythmicaLyrics 官方",
-        "url": "http://timetag.main.jp/RhythmicaLyrics/kakuteiyominet.php",
+        # https：服务端已支持 TLS（避免明文 HTTP 传输 + 系统代理/防火墙
+        # 对明文请求的干扰）；ensure_builtin_sources 会把旧存档中的
+        # 内置源 URL 强制刷新为此值
+        "url": "https://timetag.main.jp/RhythmicaLyrics/kakuteiyominet.php",
         "builtin": True,
         "enabled": True,
     }
@@ -130,6 +136,7 @@ def fetch_source_entries(
     timeout: float = 8.0,
     allow_insecure_fallback: bool = True,
     proxies: Optional[Dict[str, str]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """HTTP 拉取一个 RL 兼容的网络源 → annotated entries。
 
@@ -140,6 +147,8 @@ def fetch_source_entries(
     HTTPS 路径默认用 ``certifi`` 根证书包验证；若验证失败且
     ``allow_insecure_fallback=True`` 则改用未验证上下文重试一次（Windows 上
     系统证书链缺失的常见兜底，仅用于公开词典数据这类无敏感性场景）。
+    降级**不静默**：记录 warning 日志，并写入 ``diagnostics`` 供调用方在
+    UI 上展示。
 
     Args:
         url: 服务端 PHP 端点 URL。
@@ -148,6 +157,8 @@ def fetch_source_entries(
         proxies: 应用代理（:func:`resolve_app_proxies` 产物）。
             ``None`` 保持 urllib 默认（读系统环境变量）；``{}`` 显式禁用
             代理（mode=off）；非空 dict 则经 ``ProxyHandler`` 走代理。
+        diagnostics: 可选的诊断信息输出字典。发生无验证降级重试时写入
+            ``{"insecure_fallback": True, "reason": <错误描述>}``。
 
     Returns:
         annotated 条目列表（同 :func:`parse_rl_dictionary` 输出格式）。
@@ -157,7 +168,10 @@ def fetch_source_entries(
         ssl.SSLError: 在 ``allow_insecure_fallback=False`` 时把 SSL 错误透传。
         ValueError: 响应体不以 ``[success]`` 开头。
     """
-    full_url = f"{url}?req=get&dummy={int(time.time() * 1000)}"
+    # 源 URL 自带 query（如 ...php?req=version）时必须用 & 续接参数，
+    # 直接拼 ? 会得到非法 URL 破坏原有查询串
+    sep = "&" if "?" in url else "?"
+    full_url = f"{url}{sep}req=get&dummy={int(time.time() * 1000)}"
     req = urllib.request.Request(
         full_url,
         headers={"User-Agent": "StrangeUtaGame/1.0 (+rl-compat)"},
@@ -185,6 +199,16 @@ def fetch_source_entries(
         )
         if not (is_cert_err and allow_insecure_fallback):
             raise
+        # 降级为无验证重试不能静默：记录日志并写入诊断信息，
+        # 供调用方（auto_update_enabled_sources 等）在 UI 上提示
+        logger.warning(
+            "网络词典源证书验证失败，已降级为无验证拉取: %s（%s）",
+            url,
+            reason,
+        )
+        if diagnostics is not None:
+            diagnostics["insecure_fallback"] = True
+            diagnostics["reason"] = str(reason)
         raw = _do_request(insecure=True)
 
     body = raw.decode("utf-8", errors="replace")
@@ -419,10 +443,19 @@ def auto_update_enabled_sources(
         if not url:
             continue
         try:
-            entries = fetch_source_entries(url, timeout=timeout, proxies=proxies)
+            diag: Dict[str, Any] = {}
+            entries = fetch_source_entries(
+                url, timeout=timeout, proxies=proxies, diagnostics=diag
+            )
             src["entries"] = entries
             src["last_fetched"] = int(time.time())
             ok_msgs.append(f"{src.get('name', src.get('id', '?'))}: {len(entries)} 条")
+            if diag.get("insecure_fallback"):
+                # 降级事件对用户可见（拉取成功但跳过了证书验证）
+                ok_msgs.append(
+                    f"{src.get('name', src.get('id', '?'))}: "
+                    "证书验证失败，已降级为无验证拉取（请检查系统证书链）"
+                )
         except Exception as e:
             fail_msgs.append(f"{src.get('name', src.get('id', '?'))}: {e}")
     return ok_msgs, fail_msgs

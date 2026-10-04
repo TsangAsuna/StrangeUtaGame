@@ -57,11 +57,11 @@ class LRCExporter(BaseExporter):
         # 元数据标签
         if project.metadata:
             if project.metadata.title:
-                lines.append(f"[ti:{project.metadata.title}]")
+                lines.append(f"[ti:{self._escape_id_tag_value(project.metadata.title)}]")
             if project.metadata.artist:
-                lines.append(f"[ar:{project.metadata.artist}]")
+                lines.append(f"[ar:{self._escape_id_tag_value(project.metadata.artist)}]")
             if project.metadata.album:
-                lines.append(f"[al:{project.metadata.album}]")
+                lines.append(f"[al:{self._escape_id_tag_value(project.metadata.album)}]")
 
             # 工具信息
             lines.append(f"[by:StrangeUtaGame]")
@@ -81,6 +81,12 @@ class LRCExporter(BaseExporter):
             raise ExportError(f"写入文件失败: {e}")
 
     # ── 辅助：定位停顿点拖音时间戳 ──
+    @staticmethod
+    def _escape_id_tag_value(value: str) -> str:
+        """转义 ID 标签值中的半角 ]——它会提前闭合 [ti:...] 标签，
+        破坏解析；替换为全角 ］ 保证内容与标签边界完整。"""
+        return value.replace("]", "］")
+
     def _find_sentence_end_ts(self, sentence: Sentence) -> Optional[int]:
         """取本行最后一个标记为 is_sentence_end 的字符的 global_sentence_end_ts。
 

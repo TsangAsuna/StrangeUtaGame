@@ -305,6 +305,7 @@ def test_poll_pauses_exactly_at_locked_end_at_1_5x_speed(monkeypatch):
         _timing_service=service,
         _playback_range_end_ms=6_000,
         _last_polled_duration_ms=None,
+        _pressed_keys=set(),  # A7：暂停/结束时清理悬挂打轴键
         transport=transport,
         timeline=timeline,
         preview=preview,
@@ -401,6 +402,7 @@ def test_manual_pause_selects_edit_mode_without_requerying_engine():
         _auto_scroll_cooldown_timer=SimpleNamespace(stop=lambda: None),
         _position_poll_timer=SimpleNamespace(stop=lambda: None),
         _validate_all_timestamps=lambda: None,
+        _pressed_keys=set(),  # A7：暂停/结束时清理悬挂打轴键
     )
 
     EditorInterface._on_pause(editor)

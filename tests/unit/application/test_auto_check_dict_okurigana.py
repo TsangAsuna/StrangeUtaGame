@@ -5,6 +5,8 @@ fallback），该 phase 在 dictionary annotated 化重构后被 Phase 5
 「用户词典直接覆盖整段 Character[]」取代，相应用例已整体删除。
 """
 
+import pytest
+
 from strange_uta_game.backend.application import AutoCheckService
 from strange_uta_game.backend.domain import Sentence
 from strange_uta_game.backend.domain.models import Character
@@ -14,8 +16,16 @@ from strange_uta_game.backend.infrastructure.parsers.ruby_analyzer import (
 
 
 def _get_sudachi():
-    """返回测试使用的跨平台真实注音分析器。"""
-    return SudachiAnalyzer()
+    """返回测试使用的跨平台真实注音分析器。
+
+    sudachipy / sudachidict_small 是 noWinIME / mac 变体的可选依赖
+    （requirements-variants.txt），主变体环境未安装时跳过本文件的
+    Sudachi 用例，而不是以 ImportError 失败。
+    """
+    try:
+        return SudachiAnalyzer()
+    except ImportError as exc:
+        pytest.skip(f"sudachi 分析器不可用，跳过：{exc}")
 
 
 def _serialize(chars):

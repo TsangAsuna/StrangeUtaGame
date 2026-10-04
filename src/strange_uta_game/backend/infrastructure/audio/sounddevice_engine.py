@@ -135,6 +135,13 @@ class SoundDeviceEngine(IAudioEngine):
         # 回调线程从不持此锁。
         self._state_lock = threading.Lock()
 
+        # ---- 喂数据代数（epoch）----
+        # seek/换源/load/stop 都会使 producer 当前这轮"读 pos → 写 ring →
+        # 推进 pos"失效。原先仅凭 active_pcm 身份比对无法识别"同一份 PCM
+        # 上的 seek"，锁外窗口里的 seek 会被吞掉、ring 混入旧位置音频。
+        # 控制路径改 pos 时递增；producer 全程比对写入前后的 epoch。
+        self._epoch: int = 0
+
         self._stream: Optional[sd.OutputStream] = None
 
         # ---- 硬件延迟补偿 ----
@@ -150,6 +157,11 @@ class SoundDeviceEngine(IAudioEngine):
         # 由 _audio_callback（PortAudio 实时线程）更新，无竞态：
         # _consumed_in_active_pcm = 当前 active PCM 上已消费的帧数
         # _last_callback_perf_time = 上次回调的 perf_counter 时间戳
+        # 注意：int 的 += 并非原子（LOAD/ADD/STORE 三步可被 GIL 切开），
+        # 回调线程与 seek/换源（控制线程）的写入必须经 _anchor_lock 串行。
+        # 该锁内只有毫秒级赋值，回调线程可安全使用；且回调从不取
+        # _state_lock，两个锁之间不构成环，无死锁风险。
+        self._anchor_lock = threading.Lock()
         self._consumed_in_active_pcm: int = 0
         self._last_callback_perf_time: float = 0.0
 
@@ -211,6 +223,8 @@ class SoundDeviceEngine(IAudioEngine):
                 self._speed = 1.0
                 self._pending_speed = 1.0
                 self._read_pos_samples = 0
+                # 换歌：作废旧 producer 可能仍在途的喂数据轮次
+                self._epoch += 1
 
             self._state = PlaybackState.STOPPED
 
@@ -255,9 +269,14 @@ class SoundDeviceEngine(IAudioEngine):
         ]
         for speed, priority in common_speeds:
             if speed_min - 1e-9 <= speed <= speed_max + 1e-9:
-                self._cache.ensure(speed, priority=priority)
+                # check_only=True：预热只查存在性/派发渲染，绝不在调用线程
+                # （UI 线程）对已缓存的档位做整曲 MP3 同步解码再丢弃。
+                self._cache.ensure(speed, priority=priority, check_only=True)
 
     def release(self) -> None:
+        # 彻底关闭 PortAudio 流并停掉 producer 线程：只 stop() 不关流的话，
+        # 引擎释放后设备仍被占用，新旧引擎实例会争抢同一输出端点。
+        self._stop_streaming()
         self.stop()
         self._cache.clear()
         with self._state_lock:
@@ -267,8 +286,10 @@ class SoundDeviceEngine(IAudioEngine):
             self._file_path = None
             self._duration_ms = 0
             self._read_pos_samples = 0
-            self._consumed_in_active_pcm = 0
-            self._last_callback_perf_time = 0.0
+            with self._anchor_lock:
+                self._consumed_in_active_pcm = 0
+                self._last_callback_perf_time = 0.0
+            self._stream_latency_frames = 0
         self._ring = None
 
     # ==================== 播放控制 ====================
@@ -308,8 +329,10 @@ class SoundDeviceEngine(IAudioEngine):
 
         with self._state_lock:
             self._read_pos_samples = 0
-            self._consumed_in_active_pcm = 0
-            self._last_callback_perf_time = 0.0
+            self._epoch += 1
+            with self._anchor_lock:
+                self._consumed_in_active_pcm = 0
+                self._last_callback_perf_time = 0.0
             if self._original_data is not None:
                 # 始终让 active 与当前速度保持一致
                 if abs(self._speed - 1.0) < 1e-9:
@@ -343,11 +366,14 @@ class SoundDeviceEngine(IAudioEngine):
         ``_consumed_in_active_pcm`` 在回调写入时更新，但声音还在硬件缓冲里，
         减去该偏移量后位置轴与用户听到的声音对齐。
         """
+        # 锚点由回调线程经 _anchor_lock 写入（+= 非原子，见 __init__ 注释），
+        # 读取也必须走同一把锁；其余控制平面字段仍归 _state_lock。
+        with self._anchor_lock:
+            base_consumed = self._consumed_in_active_pcm
+            base_time = self._last_callback_perf_time
         with self._state_lock:
             if self._active_pcm is None or self._sample_rate == 0:
                 return 0
-            base_consumed = self._consumed_in_active_pcm
-            base_time = self._last_callback_perf_time
             speed = self._active_speed
             sr = self._sample_rate
             latency_frames = self._stream_latency_frames
@@ -388,9 +414,13 @@ class SoundDeviceEngine(IAudioEngine):
             new_pos = int(orig_samples / self._active_speed)
             new_pos = max(0, min(new_pos, len(self._active_pcm)))
             self._read_pos_samples = new_pos
+            # epoch 递增：使 producer 在途的"读旧 pos → 写 ring → 推进 pos"
+            # 整轮作废（写入前后的 epoch 比对不通过），不再污染 ring/吞 seek。
+            self._epoch += 1
             # 重置消费者锚点（seek 后回调线程会从新位置开始消费）
-            self._consumed_in_active_pcm = new_pos
-            self._last_callback_perf_time = time.perf_counter()
+            with self._anchor_lock:
+                self._consumed_in_active_pcm = new_pos
+                self._last_callback_perf_time = time.perf_counter()
         # 丢弃 ring 里的旧样本
         if self._ring is not None:
             self._ring.reset()
@@ -593,9 +623,13 @@ class SoundDeviceEngine(IAudioEngine):
             # underrun：补零，不抛错（旧版会触发 PortAudio 错位）
             outdata[n:].fill(0)
 
-        # 更新消费者侧锚点（PortAudio 实时线程，GIL 保证原子性）
-        self._consumed_in_active_pcm += n
-        self._last_callback_perf_time = time.perf_counter()
+        # 更新消费者侧锚点（PortAudio 实时线程）。
+        # += 不是原子操作（LOAD/ADD/STORE 可被 GIL 切开），与 seek/换源线程
+        # 的锚点重置并发时会互相覆盖——用专用 _anchor_lock 串行（锁内仅两次
+        # 赋值，回调线程可安全使用；时间戳与消费量成对更新保证外推一致性）。
+        with self._anchor_lock:
+            self._consumed_in_active_pcm += n
+            self._last_callback_perf_time = time.perf_counter()
 
         if self._volume != 1.0:
             outdata *= self._volume
@@ -628,9 +662,13 @@ class SoundDeviceEngine(IAudioEngine):
                 continue
 
             # 3) 喂数据
+            # epoch 快照 + 写入前后双检：read pos 之后、写 ring 之前可能有
+            # seek/换源/load 插入（原先仅凭 active_pcm 身份比对，识别不了
+            # "同一份 PCM 上的 seek"）——旧位置数据会写进 ring 且 seek 被吞。
             with self._state_lock:
                 pcm = self._active_pcm
                 pos = self._read_pos_samples
+                epoch = self._epoch
                 total = 0 if pcm is None else len(pcm)
 
             if pcm is None:
@@ -649,13 +687,16 @@ class SoundDeviceEngine(IAudioEngine):
                 continue
 
             chunk_n = min(free, remaining)
-            chunk = pcm[pos : pos + chunk_n]
-            written = self._ring.write_from(chunk)
-            if written > 0:
-                with self._state_lock:
-                    # 仅当 active 没被换掉时才推进 pos
-                    if self._active_pcm is pcm:
-                        self._read_pos_samples += written
+            written = 0
+            with self._state_lock:
+                if self._epoch != epoch:
+                    # 快照后发生了 seek/换源/load：本轮作废，下轮从新位置读
+                    continue
+                chunk = pcm[pos : pos + chunk_n]
+                written = self._ring.write_from(chunk)
+                # 仅当 epoch 未变时推进 pos，避免覆盖 seek/换源设置的新位置
+                if written > 0 and self._epoch == epoch:
+                    self._read_pos_samples += written
 
     def _maybe_swap_active_speed(self) -> None:
         """如有 pending 速度切换且新 PCM 已就绪，原子换 active 并保位。"""
@@ -686,13 +727,21 @@ class SoundDeviceEngine(IAudioEngine):
             self._active_pcm = new_pcm
             self._active_speed = pending  # 使用用户设置的速度
             self._read_pos_samples = new_consumed
-            self._consumed_in_active_pcm = new_consumed
-            self._last_callback_perf_time = time.perf_counter()
+            # epoch 递增：本轮换源使 producer 在途喂数据作废（同 seek）。
+            self._epoch += 1
+            # 锚点扣除 ring 里尚未消费的旧速度残留帧：回调会先把这段旧音频
+            # 播完才开始消费新 PCM，若直接把锚点设为 new_consumed，位置会
+            # 领先实际声音约"残留时长 × 速度"（ring 最多 ~500ms），且要等
+            # 下次 seek 才能纠正。
+            residual = self._ring.available_read() if self._ring is not None else 0
+            with self._anchor_lock:
+                self._consumed_in_active_pcm = max(0, new_consumed - residual)
+                self._last_callback_perf_time = time.perf_counter()
             # 更新 pending_speed 为当前 speed，避免重复 swap
             self._pending_speed = self._speed
 
-        # 不再 reset ring buffer，让新旧 PCM 平滑过渡
-        # ring buffer 中的旧数据会被新数据自然覆盖
+        # 不 reset ring buffer，让新旧 PCM 平滑过渡（扣除残留帧后位置轴
+        # 与"先把旧音频播完再播新音频"的实际输出保持一致）
 
     def _on_eof(self) -> None:
         """active PCM 喂完了：等 ring 排空，置 PAUSED。
@@ -707,7 +756,13 @@ class SoundDeviceEngine(IAudioEngine):
                 if self._producer_stop.is_set():
                     return
                 time.sleep(_PRODUCER_TICK)
-        self._state = PlaybackState.PAUSED
+        # D14 竞态守卫：排空期间 stop()/release() 可能已把状态置为 STOPPED
+        # （stop() 的锁内段此时可能尚未跑到，但 _producer_stop 已在
+        # _stop_streaming 里置位）——不得把 STOPPED 改写成 PAUSED。
+        if self._producer_stop.is_set():
+            return
+        if self._state == PlaybackState.PLAYING:
+            self._state = PlaybackState.PAUSED
 
     def _perform_hot_recovery(self) -> None:
         """执行音频流热重载（断线重连）
@@ -748,6 +803,17 @@ class SoundDeviceEngine(IAudioEngine):
                 latency=_TARGET_LATENCY,
                 callback=self._audio_callback,
             )
+            # D14 竞态守卫：开流是耗时操作，期间 release()/load() 可能已调
+            # _stop_streaming（其 join 超时后不再等待本线程）——此刻不能再
+            # start 一个无人认领的新流，否则旧 producer 复活设备占用，
+            # 与 _start_streaming 新起的 producer 形成双线程并发。
+            if self._producer_stop.is_set():
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+                return
             self._stream.start()
 
             # 更新硬件延迟补偿帧数（新设备的 latency 可能与旧设备不同）

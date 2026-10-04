@@ -74,10 +74,17 @@ class FileLoader:
         self._loading_worker = None
         self._state_tooltip = None
         self._project_on_success = None  # 可选的加载成功额外回调 (project, file_path)
+        # 视频提取线程（独立于项目加载线程，防重入 + 身份校验）
+        self._video_thread: QThread | None = None
+        self._video_worker = None
+        # 视频提取的临时音轨（换音频/换项目时 best-effort 清理）
+        self._temp_audio_path: str | None = None
         # 异步歌词解析相关
         self._lyric_thread: QThread | None = None
         self._lyric_worker = None
         self._lyric_tooltip = None
+        # 在途歌词解析提交时的项目身份（迟到结果按身份丢弃，防覆盖新项目）
+        self._lyric_target_project = None
 
     @property
     def _project(self):
@@ -101,6 +108,7 @@ class FileLoader:
         """处理拖拽文件"""
         kind = classify_supported_file(file_path)
         if kind == "audio":
+            self._cleanup_temp_audio()
             self._editor.load_audio(file_path)
             self._save_last_dir(file_path)
         elif kind == "video":
@@ -123,12 +131,15 @@ class FileLoader:
         project = ProjectService().create_project()
         self._store.load_project(project)
         self._reset_nicokara_tags_to_defaults()
+        # 新建项目后上一项目的视频临时音轨作废，best-effort 清理
+        self._cleanup_temp_audio()
 
     def load_media(self, file_path: str) -> None:
         """加载音频或视频文件（视频先经 FFmpeg 提取音轨，异步）。"""
         if is_video_file(file_path):
             self._load_video_as_audio(file_path)
         else:
+            self._cleanup_temp_audio()
             self._editor.load_audio(file_path)
 
     # ── 菜单/按钮触发 ──
@@ -265,6 +276,7 @@ class FileLoader:
             if is_video_file(path):
                 self._load_video_as_audio(path)
             else:
+                self._cleanup_temp_audio()
                 self._editor.load_audio(path)
                 self._save_last_dir(path)
             self._notify_main_window_frameless_refresh()
@@ -291,6 +303,11 @@ class FileLoader:
     def _load_video_as_audio(self, file_path: str):
         """加载视频文件，提取音频并加载（异步）"""
         from strange_uta_game.frontend.theme import theme
+
+        # 防重入：视频提取进行中忽略新请求，避免与 load_audio 并发操作
+        # 音频引擎导致句柄互相覆盖（与 _audio_loading 守卫同型）。
+        if self._video_thread is not None:
+            return
 
         # 检查 FFmpeg 是否可用
         if not is_ffmpeg_available():
@@ -328,28 +345,41 @@ class FileLoader:
         from strange_uta_game.frontend.workers import VideoExtractWorker
 
         engine = self._timing_service._audio_engine if self._timing_service else None
-        self._loading_thread = QThread(self._editor)
-        self._loading_worker = VideoExtractWorker(engine, file_path)
-        self._loading_worker.moveToThread(self._loading_thread)
+        thread = QThread(self._editor)
+        worker = VideoExtractWorker(engine, file_path)
+        worker.moveToThread(thread)
 
-        # 连接信号
-        self._loading_thread.started.connect(self._loading_worker.run)
-        self._loading_worker.progress.connect(self._on_video_progress)
-        self._loading_worker.finished.connect(lambda temp: self._on_video_loaded(temp, file_path))
-        self._loading_worker.error.connect(self._on_video_error)
-        self._loading_worker.finished.connect(self._cleanup_video_thread)
-        self._loading_worker.error.connect(self._cleanup_video_thread)
+        # 记录当前身份：完成/失败回调先比对身份，迟到的过期信号直接丢弃
+        self._video_thread = thread
+        self._video_worker = worker
+
+        # 连接信号（线程/worker 引用随信号局部捕获，按身份清理）
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_video_progress)
+        worker.finished.connect(
+            lambda temp, w=worker, p=file_path: self._on_video_loaded(temp, p, w)
+        )
+        worker.error.connect(lambda msg, w=worker: self._on_video_error(msg, w))
+        worker.finished.connect(
+            lambda t=thread, w=worker: self._cleanup_video_thread(t, w)
+        )
+        worker.error.connect(
+            lambda t=thread, w=worker: self._cleanup_video_thread(t, w)
+        )
 
         # 启动线程
-        self._loading_thread.start()
+        thread.start()
 
     def _on_video_progress(self, stage: str, value: float) -> None:
         """更新视频处理进度"""
         if self._state_tooltip:
             self._state_tooltip.setContent(stage)
 
-    def _on_video_loaded(self, temp_path: str, original_path: str) -> None:
+    def _on_video_loaded(self, temp_path: str, original_path: str, worker=None) -> None:
         """视频提取+加载完成的回调"""
+        # 身份校验：过期 worker 的迟到信号不生效
+        if worker is not None and worker is not self._video_worker:
+            return
         if self._state_tooltip:
             self._state_tooltip.setState(True)
             self._state_tooltip.setContent(self._editor.tr("加载完成"))
@@ -428,13 +458,34 @@ class FileLoader:
             parent=self._editor,
         )
 
-        # 记录临时文件路径以便后续清理
+        # 记录临时文件路径以便后续清理；上一条临时音轨（若有）此时引擎
+        # 已切换到新音频，不再被引用，可以安全删除。
+        self._cleanup_temp_audio()
         self._temp_audio_path = temp_path
 
         self._notify_main_window_frameless_refresh()
 
-    def _on_video_error(self, error_msg: str) -> None:
+    def _cleanup_temp_audio(self) -> None:
+        """删除上一条视频提取的临时音轨（best-effort）。
+
+        Windows 下引擎可能仍占用文件句柄，删除失败时保留路径留待下次
+        重试，不影响加载流程。
+        """
+        path = self._temp_audio_path
+        if not path:
+            return
+        self._temp_audio_path = None
+        try:
+            if Path(path).is_file():
+                Path(path).unlink()
+        except OSError:
+            self._temp_audio_path = path
+
+    def _on_video_error(self, error_msg: str, worker=None) -> None:
         """视频处理失败的回调"""
+        # 身份校验：过期 worker 的迟到信号不生效
+        if worker is not None and worker is not self._video_worker:
+            return
         if self._state_tooltip:
             self._state_tooltip.close()
             self._state_tooltip = None
@@ -448,15 +499,21 @@ class FileLoader:
             parent=self._editor,
         )
 
-    def _cleanup_video_thread(self) -> None:
-        """清理视频处理线程"""
-        if self._loading_thread:
-            self._loading_thread.quit()
-            self._loading_thread.wait()
-            self._loading_thread = None
-        if self._loading_worker:
-            self._loading_worker.deleteLater()
-            self._loading_worker = None
+    def _cleanup_video_thread(self, thread=None, worker=None) -> None:
+        """清理视频处理线程（按身份清理，不误伤其他线程）"""
+        if thread is None:
+            thread = self._video_thread
+        if worker is None:
+            worker = self._video_worker
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+        if worker is not None:
+            worker.deleteLater()
+        if self._video_thread is thread:
+            self._video_thread = None
+        if self._video_worker is worker:
+            self._video_worker = None
 
     # ── 实际加载逻辑 ──
 
@@ -497,6 +554,9 @@ class FileLoader:
 
     def load_project(self, file_path: str, check_unsaved: bool = True, on_success=None):
         """加载 .sug 项目文件（异步）"""
+        # 防重入：项目解析进行中忽略新请求（避免线程/worker 引用被覆盖）
+        if self._loading_thread is not None:
+            return
         if check_unsaved and not self.check_unsaved_changes():
             return
 
@@ -539,6 +599,9 @@ class FileLoader:
 
     def _on_project_loaded(self, project, file_path: str, extras: dict = None) -> None:
         """项目加载完成的回调"""
+        # 打开新项目后上一项目的视频临时音轨作废，best-effort 清理
+        # （若新项目的媒体正是同一视频，提取产物路径相同，随后会重新生成）
+        self._cleanup_temp_audio()
         if self._state_tooltip:
             self._state_tooltip.setState(True)
             self._state_tooltip.setContent(self._editor.tr("加载完成"))
@@ -608,6 +671,8 @@ class FileLoader:
         if is_video_file(media_path):
             self._load_video_as_audio(media_path)
         else:
+            # 换音频：上一项目的视频临时音轨作废，best-effort 清理
+            self._cleanup_temp_audio()
             self._editor.load_audio(media_path)
 
     def _apply_nicokara_tags_from_data(self, data: dict) -> None:
@@ -692,6 +757,11 @@ class FileLoader:
             self._lyric_tooltip.close()
             self._lyric_tooltip = None
 
+        # 身份校验：解析期间用户可能已打开/新建了其他项目，迟到的旧歌词
+        # 不得覆盖新项目（worker 结果在提交时携带项目身份）。
+        if self._lyric_target_project is not None and self._project is not self._lyric_target_project:
+            return
+
         sentences = result["sentences"]
         is_nicokara = result["is_nicokara"]
         new_singers = result["new_singers"]
@@ -732,6 +802,7 @@ class FileLoader:
         if self._lyric_worker:
             self._lyric_worker.deleteLater()
             self._lyric_worker = None
+        self._lyric_target_project = None
 
     def _apply_lyrics_result(
         self,
@@ -909,6 +980,11 @@ class FileLoader:
         进行未保存检测，用户取消则中止。``check_unsaved=False`` 用于调用方
         （如 prompt_load_lyrics）已在弹文件框前完成检测的场景，避免二次弹窗。
         """
+        # 在途守卫：已有歌词解析正在进行时忽略本次请求（与剪贴板入口一致），
+        # 避免替换项目后线程/worker 引用被覆盖、迟到结果覆盖新项目。
+        if self._lyric_thread is not None:
+            return
+
         # 准备全新项目（含未保存检测）。需要 default_singer_id，必须在启动
         # worker 前完成。
         if not self._prepare_fresh_project_for_lyrics(check_unsaved=check_unsaved):
@@ -976,6 +1052,8 @@ class FileLoader:
             user_dict, annotate_katakana_with_english,
             content=content,
         )
+        # 记录提交时的项目身份：迟到结果在 _on_lyrics_parsed 按此校验
+        self._lyric_target_project = self._project
         self._lyric_worker.moveToThread(self._lyric_thread)
         self._lyric_thread.started.connect(self._lyric_worker.run)
         self._lyric_worker.progress.connect(self._on_lyric_progress)

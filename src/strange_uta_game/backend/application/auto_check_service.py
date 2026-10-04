@@ -1439,6 +1439,14 @@ class AutoCheckService:
                 ]
             return []
 
+        # 中文模式未加载日文分析器（_analyzer 为 None）：给出明确中文
+        # 提示，而不是把 'NoneType' object has no attribute 'analyze'
+        # 交给 worker 的宽 except 吞成难懂的失败信号
+        if self._analyzer is None:
+            raise RuntimeError(
+                "当前为中文歌词模式，未加载日文注音分析器，无法执行该分析"
+            )
+
         split_config = split_config or SplitConfig()
 
         # 拆分文本
@@ -2382,14 +2390,29 @@ class AutoCheckService:
                     ch = chars[idx + k]
                     parts = per_char_parts[k]
                     if parts:
+                        # 写词典分段后经权威 setter 收口 check_count：
+                        # 直接赋值会绕过 len(timestamps) <= check_count
+                        # 不变式，与已有时间戳共存时后续 pass 反复重对齐
+                        # 导致 ruby 分段来回摆。timestamps 策略：以词典
+                        # 段数为权威，超出部分的旧时间戳明确截断（setter
+                        # 只在缩小方向截断，这里补齐 grow 方向的收口）；
+                        # direct 模式保证放大路径只补占位、不按 mora 重切
+                        # 词典给定的分段结构。
                         ch.ruby = Ruby(parts=[RubyPart(text=p) for p in parts])
-                        ch.check_count = len(parts)
+                        ch.set_check_count(
+                            len(parts), force=True, ruby_split_mode="direct"
+                        )
+                        if len(ch.timestamps) > len(parts):
+                            ch.timestamps = ch.timestamps[: len(parts)]
+                            ch.push_to_ruby()
                     else:
                         ch.ruby = None
                         ct = get_char_type(ch.char) if len(ch.char) == 1 else CharType.OTHER
                         is_linked = k > 0 and chars[idx + k - 1].linked_to_next
                         if ct == CharType.KANJI or is_linked:
-                            ch.check_count = 0
+                            # 同经 setter 收口：ruby 已置 None，超出部分
+                            # 时间戳一并截断（cc=0 字符不持有节奏点）
+                            ch.set_check_count(0, force=True)
                         elif self._should_make_romaji_self_ruby(ch.char):
                             ch.ruby = Ruby(parts=[RubyPart(text=ch.char)])
                             # 经 setter 收口：原 check_count >= 2 时补占位符，
@@ -2767,6 +2790,16 @@ class AutoCheckService:
             update_checkpoints: True=分析后重算节奏点（默认）；
                 False=只更新注音、保留现有节奏点不动。
         """
+        # 中文模式：_analyzer 恒 None（构造时不创建日文分析器），句级
+        # 管线必须像 apply_to_project 一样分流到按字符流的中文路径，
+        # 否则逐句注音/拼音注音按钮每次都崩在
+        # 'NoneType' object has no attribute 'analyze'。中文路径自身
+        # 保留旧时间戳，节奏点按字符流重算（与 apply_to_project 中文
+        # 分支同口径：不再走 update_checkpoints_from_rubies）。
+        if self._chinese_mode:
+            self._apply_chinese_to_sentence(sentence)
+            return
+
         # 不更新节奏点：apply_to_sentence 内部会按新注音重写 check_count，
         # 故先快照整句节奏点数，分析后还原（覆盖全句，确保节奏点完全不动）。
         # 同时也快照 is_sentence_end / is_line_end。

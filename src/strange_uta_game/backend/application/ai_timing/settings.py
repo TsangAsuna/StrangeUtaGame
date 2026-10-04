@@ -62,10 +62,12 @@ def resolve_model_root(settings: AiTimingSettings) -> Path:
 
 
 def portable_base_dir() -> Path:
-    """便携基准目录：frozen = exe 所在目录；源码运行 = 仓库 src 的父目录。
+    """便携基准目录：frozen = exe 所在目录；源码运行 = ``strange_uta_game``
+    包目录（仓库 ``src/`` 下的包根）。
 
     ``runtime_python`` 位于基准目录内时以相对路径持久化——便携包整体
-    移动/换机后路径不失配（frozen 打包态的关键行为）。
+    移动/换机后路径不失配（frozen 打包态的关键行为）。读写两侧都走本
+    函数（存取自洽），仅基准所指目录层级在不同运行形态间不同。
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent

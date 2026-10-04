@@ -404,11 +404,8 @@ class DictionarySubInterface(SubSettingInterface):
         if self._settings_ref is None:
             return
         doc = self._settings_ref.load_network_dictionary()
-        cache_path = (
-            str(self._settings_ref._network_dict_path)
-            if self._settings_ref._network_dict_path is not None
-            else None
-        )
+        net_path = self._settings_ref.config_paths.network_dictionary
+        cache_path = str(net_path) if net_path is not None else None
         dialog = NetworkDictionaryDialog(doc, cache_path=cache_path, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_doc = dialog.get_doc()
@@ -566,7 +563,11 @@ class DictionarySubInterface(SubSettingInterface):
         self.btn_llm_test.setText(self.tr("测试中…"))
 
         worker = LLMTestWorker(cfg, proxies=_resolve_proxies(self._settings_ref))
-        thread = QThread(self)
+        # parent=None：不让 Qt 把 QThread 生命周期绑到本子页面——测试进行中
+        # 销毁设置页时，Qt 会 destroy 运行中的 QThread（"Destroyed while
+        # thread is still running" 崩溃）。上方 self._llm_test_* 强引用防 GC，
+        # thread.finished 的 _cleanup 负责释放（同 update_card._LaunchUpdaterWorker）。
+        thread = QThread(None)
         worker.moveToThread(thread)
         # 强引用防回收
         self._llm_test_worker = worker

@@ -902,7 +902,12 @@ class RubyInterface(QWidget):
 
     def _on_find_dialog_closed(self):
         self._find_highlights = []
-        self._find_dialog = None
+        if self._find_dialog is not None:
+            # 关闭即销毁：对话框仍以主窗口为父，留着只会随 textChanged
+            # 残留连接反复重跑搜索、复活已清掉的高亮（僵尸）。textChanged
+            # 连接已在 FindDialog.closeEvent 内断开，这里回收对象本身。
+            self._find_dialog.deleteLater()
+            self._find_dialog = None
         self._highlight_current_line()
 
     def _apply_font_size(self, pt: int):
@@ -1218,7 +1223,14 @@ class RubyInterface(QWidget):
             state_tooltip.setState(True)
             _cleanup()
 
+            # 分析期间（可达数分钟）编辑框可能有未应用的修改，整体写回会
+            # 静默回滚它们 —— 先让用户选择覆盖修改还是保留修改。
+            if not self._confirm_keep_dirty_edits(self.tr("自动分析注音")):
+                return
+
+            before_sentences = deepcopy(self._project.sentences)
             self._project.sentences = deepcopy(analyzed_project.sentences)
+            self._push_sentences_undo(before_sentences, self.tr("自动分析注音"))
             self._refresh_display()
             if hasattr(self, "_store"):
                 self._store.notify("rubies")
@@ -1380,7 +1392,13 @@ class RubyInterface(QWidget):
             state_tooltip.setState(True)
             _cleanup()
 
+            # 任务期间编辑框可能有未应用的修改，整体写回前先让用户选择。
+            if not self._confirm_keep_dirty_edits(self.tr("删除注音")):
+                return
+
+            before_sentences = deepcopy(self._project.sentences)
             self._project.sentences = deepcopy(analyzed_project.sentences)
+            self._push_sentences_undo(before_sentences, self.tr("删除注音"))
             self._refresh_display()
             if hasattr(self, "_store"):
                 self._store.notify("rubies")
@@ -1520,7 +1538,13 @@ class RubyInterface(QWidget):
             state_tooltip.setState(True)
             _cleanup()
 
+            # 任务期间编辑框可能有未应用的修改，整体写回前先让用户选择。
+            if not self._confirm_keep_dirty_edits(self.tr("更新节奏点")):
+                return
+
+            before_sentences = deepcopy(self._project.sentences)
             self._project.sentences = deepcopy(analyzed_project.sentences)
+            self._push_sentences_undo(before_sentences, self.tr("更新节奏点"))
             if hasattr(self, "_store"):
                 self._store.notify("checkpoints")
 
@@ -1564,6 +1588,79 @@ class RubyInterface(QWidget):
 
     # ==================== 应用/还原 ====================
 
+    def _find_timing_service(self):
+        """沿父链查找 TimingService（其 command_manager 即全局撤销栈）。
+
+        独立窗口（无打轴服务祖先）返回 None，调用方退回直改行为。
+        """
+        widget = self
+        while widget is not None:
+            timing_service = getattr(widget, "_timing_service", None)
+            if timing_service is not None:
+                return timing_service
+            widget = widget.parent()
+        return None
+
+    def _push_sentences_undo(self, before_sentences, description: str) -> None:
+        """把 sentences 整体替换登记为 SentenceSnapshotCommand（可撤销）。
+
+        before 传替换前的深拷贝快照，after 取当前项目状态。找不到共享
+        CommandManager 时静默跳过（保持原不可撤销行为）。
+        """
+        if not self._project:
+            return
+        timing_service = self._find_timing_service()
+        command_manager = (
+            getattr(timing_service, "command_manager", None) if timing_service else None
+        )
+        if command_manager is None:
+            return
+        from copy import deepcopy
+
+        from strange_uta_game.backend.application.commands import (
+            SentenceSnapshotCommand,
+        )
+
+        command = SentenceSnapshotCommand(
+            self._project,
+            before_sentences,
+            deepcopy(self._project.sentences),
+            description,
+        )
+        command_manager.execute(command)
+
+    def _confirm_keep_dirty_edits(self, action: str) -> bool:
+        """后台注音任务完成、即将整体写回 sentences 前的未应用修改检查。
+
+        任务（可能耗时数分钟）期间在编辑框输入但未「应用更改」的修改会被
+        整体写回静默回滚。有修改时弹窗让用户选择；返回 True 表示继续写回，
+        False 表示保留编辑框内容、放弃任务结果（含用户取消）。
+        """
+        if not self.is_dirty():
+            return True
+        choice = message_choice(
+            self,
+            self.tr("有未应用的修改"),
+            self.tr(
+                "{action}已完成，但你在编辑框中的修改尚未「应用更改」。\n\n"
+                "「覆盖修改」：写入{action}结果，未应用的修改将被丢弃；\n"
+                "「保留修改」：放弃{action}结果，编辑框内容保持不变。"
+            ).format(action=action),
+            [self.tr("覆盖修改"), self.tr("保留修改"), self.tr("取消")],
+            default=1,
+        )
+        if choice == 1:
+            InfoBar.info(
+                title=self.tr("已保留修改"),
+                content=self.tr("已放弃{action}结果，编辑框内容未变").format(action=action),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+                parent=self,
+            )
+        return choice == 0
+
     def _on_apply_changes(self):
         """将文本编辑器内容应用回项目（逐行独立解码，自带完整时间轴）。
 
@@ -1574,6 +1671,8 @@ class RubyInterface(QWidget):
         """
         if not self._project:
             return
+
+        from copy import deepcopy
 
         from strange_uta_game.backend.infrastructure.parsers.annotated_text import (
             parse_timed_line,
@@ -1591,6 +1690,7 @@ class RubyInterface(QWidget):
             )
 
         offset = self._global_offset()
+        before_sentences = deepcopy(self._project.sentences)
         new_sentences: List[Sentence] = []
         parse_errors = []
         inherited = default_singer
@@ -1631,6 +1731,9 @@ class RubyInterface(QWidget):
         for sentence in self._project.sentences:
             for ch in sentence.characters:
                 ch.set_offset(offset)
+
+        # 整体重建 sentences 纳入撤销栈（应用前快照 → 可撤销）
+        self._push_sentences_undo(before_sentences, self.tr("应用全文本更改"))
 
         if hasattr(self, "_store"):
             self._store.notify("lyrics")

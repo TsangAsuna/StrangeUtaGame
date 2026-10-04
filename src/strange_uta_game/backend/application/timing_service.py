@@ -517,13 +517,13 @@ class TimingService:
         if not is_tail and key_type != "pressed":
             return
 
-        # 写入 + 单次推进
-        self._add_timetag_at_current_checkpoint(timestamp_ms)
-        self.move_to_next_checkpoint()
-        # 打轴键也会更新焦点
-        self._notify_focus_moved()
-        # 通知前端将当前行居中滚动
-        self._global_qt._center_current_line_signal.emit()
+        # 写入 + 单次推进（写入被拒绝时不写入也不推进）
+        if self._add_timetag_at_current_checkpoint(timestamp_ms):
+            self.move_to_next_checkpoint()
+            # 打轴键也会更新焦点
+            self._notify_focus_moved()
+            # 通知前端将当前行居中滚动
+            self._global_qt._center_current_line_signal.emit()
 
     def on_timing_key_pressed(self, key: str, queue_delay_ms: int = 0) -> None:
         """打轴按键按下处理（Space 或 F1-F9）
@@ -624,6 +624,10 @@ class TimingService:
         if not is_tail and key_type != "pressed":
             return
 
+        # 写入前校验：时间倒退告警（A1）；稀疏跳位无值可回填则拒绝（C2）
+        if not self._validate_timestamp_before_write(char, cp_idx, timestamp_ms):
+            return
+
         before_cp_idx = self._global_checkpoint_idx
 
         # 找到下一个 cp 的位置信息（将被删除）
@@ -646,10 +650,40 @@ class TimingService:
         old_char_idx = self._current_position.char_idx
         old_singer_id = char.singer_id
 
-        from copy import deepcopy
-        before_sentences = deepcopy(self._project.sentences)
+        # ── 窄快照准备（A14：只快照受影响字符，不再全项目 deepcopy）──
+        # affected: (line_idx, char_idx) → (sentence, char, sentence_id, char_idx, before_state)
+        from strange_uta_game.backend.application.commands import (
+            TagAndDeleteNextCommand,
+        )
 
-        # ── 直接修改（SentenceSnapshotCommand 会将结果作为 after 快照存储）──
+        affected: Dict[tuple, tuple] = {}
+        if self._command_manager:
+            affected[(old_line_idx, old_char_idx)] = (
+                sentence,
+                char,
+                sentence.id,
+                self._current_position.char_idx,
+                TagAndDeleteNextCommand._capture_state(char),
+            )
+            if next_pos is not None:
+                next_sentence_for_snapshot = self._project.sentences[next_pos.line_idx]
+                if next_pos.char_idx < len(next_sentence_for_snapshot.characters):
+                    next_key = (next_pos.line_idx, next_pos.char_idx)
+                    if next_key not in affected:
+                        next_char_for_snapshot = next_sentence_for_snapshot.characters[
+                            next_pos.char_idx
+                        ]
+                        affected[next_key] = (
+                            next_sentence_for_snapshot,
+                            next_char_for_snapshot,
+                            next_sentence_for_snapshot.id,
+                            next_pos.char_idx,
+                            TagAndDeleteNextCommand._capture_state(
+                                next_char_for_snapshot
+                            ),
+                        )
+
+        # ── 直接修改（窄快照命令把 before/after 状态交给 CommandManager）──
 
         # 1. 写入当前 cp 时间戳
         if is_tail:
@@ -675,16 +709,16 @@ class TimingService:
                     except Exception:
                         pass
 
-        after_sentences = deepcopy(self._project.sentences)
-
-        # ── 注册撤销命令 ──
+        # ── 注册撤销命令（窄快照）──
         if self._command_manager:
-            from strange_uta_game.backend.application.commands import SentenceSnapshotCommand
-
-            cmd = SentenceSnapshotCommand(
+            entries = [
+                (sid, cidx, before, TagAndDeleteNextCommand._capture_state(ch))
+                for (_line_i, _char_i), (_sent, ch, sid, cidx, before) in
+                affected.items()
+            ]
+            cmd = TagAndDeleteNextCommand(
                 project=self._project,
-                before_sentences=before_sentences,
-                after_sentences=after_sentences,
+                entries=entries,
                 description="打轴并删除下一节奏点",
             )
             cmd.undo_cp_idx = before_cp_idx
@@ -740,18 +774,25 @@ class TimingService:
         timestamp_ms = max(0, timing_pos_ms + self._timing_offset_ms)
         self.on_key_changed(timestamp_ms, key_type)
 
-    def _add_timetag_at_current_checkpoint(self, timestamp_ms: int) -> None:
+    def _add_timetag_at_current_checkpoint(self, timestamp_ms: int) -> bool:
         """在当前 checkpoint 添加时间标签
 
         Args:
             timestamp_ms: 时间戳（毫秒）
+
+        Returns:
+            True 表示写入成功；False 表示写入被拒（如稀疏跳位无值可回填）
         """
         sentence, char = self._get_current_checkpoint_info()
         if not sentence or not char:
-            return
+            return False
 
         checkpoint_idx = self._current_position.checkpoint_idx
         before_cp_idx = self._global_checkpoint_idx
+
+        # 写入前校验：时间倒退告警（A1）；稀疏跳位无值可回填则拒绝（C2）
+        if not self._validate_timestamp_before_write(char, checkpoint_idx, timestamp_ms):
+            return False
 
         if self._command_manager and self._project:
             from strange_uta_game.backend.application.commands import AddTimeTagCommand
@@ -783,11 +824,70 @@ class TimingService:
                 self._current_position.checkpoint_idx,
                 timestamp_ms,
             )
+        return True
 
     def _notify_error(self, error_type: str, message: str) -> None:
         """通知错误"""
         if self._callbacks:
             self._callbacks.on_timing_error(error_type, message)
+
+    def _get_prev_written_timestamp(self) -> Optional[int]:
+        """向前查找最近的已写入时间戳（沿全局 cp 序列，A1 顺序校验用）。
+
+        Returns:
+            最近的已写入时间戳；当前 cp 之前没有任何已写入时间戳时返回 None。
+        """
+        if not self._project:
+            return None
+        for idx in range(self._global_checkpoint_idx - 1, -1, -1):
+            pos = self._global_checkpoints[idx]
+            if pos.line_idx >= len(self._project.sentences):
+                continue
+            sentence = self._project.sentences[pos.line_idx]
+            char = sentence.get_character(pos.char_idx)
+            if char is None:
+                continue
+            if char.is_sentence_end_tail_cp(pos.checkpoint_idx):
+                if char.sentence_end_ts is not None:
+                    return char.sentence_end_ts
+            elif pos.checkpoint_idx < len(char.timestamps):
+                return char.timestamps[pos.checkpoint_idx]
+        return None
+
+    def _validate_timestamp_before_write(
+        self, char: Character, checkpoint_idx: int, timestamp_ms: int
+    ) -> bool:
+        """打轴写入前的时间戳校验（A1 顺序 / C2 稀疏）。
+
+        - 顺序校验：与前一全局 cp 已写入的时间戳比较，倒退时经
+          ``on_timing_error(TIMESTAMP_BACKWARD)`` 上报告警（不阻断写入，
+          由前端弹提示告知用户时间轴出现倒退）。
+        - 稀疏校验：目标普通 cp 之前没有任何已写入时间戳（无前一 cp 时间戳
+          可回填空位）时拒绝本次写入，并经 ``on_timing_error(TIMESTAMP_GAP)``
+          上报，避免产生破坏单调性的时间轴。
+
+        Returns:
+            True 表示允许写入，False 表示拒绝写入。
+        """
+        prev_ts = self._get_prev_written_timestamp()
+        if prev_ts is not None and timestamp_ms < prev_ts:
+            self._notify_error(
+                "TIMESTAMP_BACKWARD",
+                f"时间戳 {timestamp_ms}ms 早于前一节奏点 {prev_ts}ms",
+            )
+
+        is_tail = char.is_sentence_end_tail_cp(checkpoint_idx)
+        if (
+            not is_tail
+            and checkpoint_idx > len(char.timestamps)
+            and not char.timestamps
+        ):
+            self._notify_error(
+                "TIMESTAMP_GAP",
+                f"已跳过前一节奏点（尚无时间戳），拒绝本次 {timestamp_ms}ms 写入",
+            )
+            return False
+        return True
 
     def adjust_current_timestamp(self, delta_ms: int) -> bool:
         """微调当前选中 checkpoint 的时间戳（批 18 #8）。
@@ -801,11 +901,14 @@ class TimingService:
             _update_offset_timestamps() 重算 render/export，再 push_to_ruby()
             同步 Ruby.timestamps 和 RubyPart.offset_ms。
 
+        微调通过 SetTimestampCommand 进入 CommandManager（A8），可撤销/重做；
+        未接入 CommandManager 时退化为直接写。
+
         Args:
             delta_ms: 时间戳增量（毫秒，可正可负）
 
         Returns:
-            True 表示写入成功，False 表示当前位置无可调时间戳
+            True 表示写入成功（含零增量 no-op），False 表示当前位置无可调时间戳
         """
         if not self._project:
             return False
@@ -813,16 +916,45 @@ class TimingService:
         if not sentence or not char:
             return False
         cp_idx = self._current_position.checkpoint_idx
-        if char.is_sentence_end and cp_idx == char.check_count:
+        is_tail = char.is_sentence_end and cp_idx == char.check_count
+        if is_tail:
             if char.sentence_end_ts is None:
                 return False
-            char.set_sentence_end_ts(max(0, char.sentence_end_ts + delta_ms))
+            old_ts = char.sentence_end_ts
         else:
             if cp_idx >= len(char.timestamps):
                 return False
-            char.timestamps[cp_idx] = max(0, char.timestamps[cp_idx] + delta_ms)
-            char._update_offset_timestamps()
-            char.push_to_ruby()
+            old_ts = char.timestamps[cp_idx]
+
+        new_ts = max(0, old_ts + delta_ms)
+        if new_ts == old_ts:
+            # 零增量 no-op：不写入也不产生撤销条目
+            return True
+
+        if self._command_manager:
+            from strange_uta_game.backend.application.commands import (
+                SetTimestampCommand,
+            )
+
+            cmd = SetTimestampCommand(
+                project=self._project,
+                sentence_id=sentence.id,
+                char_idx=self._current_position.char_idx,
+                checkpoint_idx=cp_idx,
+                old_ts=old_ts,
+                new_ts=new_ts,
+                is_sentence_end_cp=is_tail,
+            )
+            cmd.undo_cp_idx = self._global_checkpoint_idx
+            cmd.redo_cp_idx = self._global_checkpoint_idx
+            self._command_manager.execute(cmd)
+        else:
+            if is_tail:
+                char.set_sentence_end_ts(new_ts)
+            else:
+                char.timestamps[cp_idx] = new_ts
+                char._update_offset_timestamps()
+                char.push_to_ruby()
         return True
 
     # ==================== 音频控制 ====================
@@ -985,7 +1117,12 @@ class TimingService:
     def add_timetag_batch(
         self, timestamps_ms: List[int], line_indices: Optional[List[int]] = None
     ) -> int:
-        """批量添加时间标签
+        """批量添加时间标签（internal：未接入 CommandManager，不可撤销）。
+
+        .. internal::
+            预留的批量打轴辅助 API，当前无调用方；写入不经 CommandManager，
+            不产生撤销条目，也不触发光标/信号联动。正式打轴请走
+            on_key_changed / on_edit_mode_tag 入口。
 
         Args:
             timestamps_ms: 时间戳列表

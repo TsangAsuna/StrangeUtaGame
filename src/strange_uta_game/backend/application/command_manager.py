@@ -60,12 +60,23 @@ class CommandManager:
 
         Returns:
             撤销的命令描述，如果没有可撤销的命令则返回 None
+
+        Raises:
+            命令 undo 抛出的异常原样向上传递；此时命令放回撤销栈原位，
+            栈与数据保持一致（事务式迁移）。
         """
         if not self._undo_stack:
             return None
 
+        # 事务式迁移：暂存 → 执行 → 落位。执行失败时命令放回原栈，
+        # 避免异常把命令"吞掉"导致栈与数据不一致。
         command = self._undo_stack.pop()
-        command.undo()
+        try:
+            command.undo()
+        except Exception:
+            self._undo_stack.append(command)
+            self._notify_state_changed()
+            raise
 
         # 加入重做栈
         self._redo_stack.append(command)
@@ -79,12 +90,24 @@ class CommandManager:
 
         Returns:
             重做的命令描述，如果没有可重做的命令则返回 None
+
+        Raises:
+            命令 redo 抛出的异常原样向上传递；此时命令放回重做栈原位，
+            栈与数据保持一致（事务式迁移）。
         """
         if not self._redo_stack:
             return None
 
+        # 事务式迁移：暂存 → 执行 → 落位。执行失败时命令放回原栈，
+        # 保留重做条目（例如 AI 打轴命令 redo 抛 ProjectDriftError 时，
+        # 用户撤销该重做仍可回到 undo 态，而不是永久丢失该条目）。
         command = self._redo_stack.pop()
-        command.redo()
+        try:
+            command.redo()
+        except Exception:
+            self._redo_stack.append(command)
+            self._notify_state_changed()
+            raise
 
         # 加入撤销栈
         self._undo_stack.append(command)

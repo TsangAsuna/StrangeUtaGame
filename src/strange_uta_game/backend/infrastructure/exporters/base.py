@@ -119,6 +119,10 @@ class BaseExporter(IExporter):
     def _ensure_extension(self, file_path: str) -> str:
         """确保文件路径有正确的扩展名"""
         path = Path(file_path)
-        if path.suffix.lower() != self.file_extension.lower():
-            return str(path.with_suffix(self.file_extension))
-        return file_path
+        if path.suffix.lower() == self.file_extension.lower():
+            return file_path
+        # 「v1.2」类名称的末段是纯数字，不是扩展名：整体追加目标扩展名，
+        # 不能用 with_suffix 把「.2」误替换掉（v1.2 → v1.lrc 丢内容）
+        if path.suffix and path.suffix[1:].isdigit():
+            return f"{file_path}{self.file_extension}"
+        return str(path.with_suffix(self.file_extension))

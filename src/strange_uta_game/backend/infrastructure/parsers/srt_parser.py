@@ -31,6 +31,10 @@ class SRTParser(LyricParser):
         """解析 SRT 格式内容"""
         lines: List[ParsedLine] = []
 
+        # 去除 UTF-8 BOM（E9）：带 BOM 的文件首块序号行 "1" 会变成
+        # "\ufeff1"，isdigit() 判定失败而被当成字幕文本
+        content = content.lstrip("\ufeff")
+
         # 按空行分割为字幕块
         blocks = re.split(r"\n\s*\n", content.strip())
 

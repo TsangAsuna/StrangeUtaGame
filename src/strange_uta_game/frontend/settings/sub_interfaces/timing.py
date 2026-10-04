@@ -13,6 +13,7 @@ from strange_uta_game.frontend.dpi_policy import HIGH_DPI_SCALING_KEY
 from strange_uta_game.frontend.font_utils import ui_font
 
 from ..calibration_dialog import CalibrationDialog
+from ..app_settings import AppSettings
 from ..cards import ComboSettingCard, SpinSettingCard, SwitchSettingCard
 from ..preview_guide_dialog import PreviewGuideDialog
 from .base import SubSettingInterface
@@ -287,7 +288,11 @@ class TimingSubInterface(SubSettingInterface):
             bool(s.get(HIGH_DPI_SCALING_KEY, True))
         )
         self.card_offset.setValue(s.get("timing.tag_offset_ms", -230))
-        self.card_speed_correction.setValue(s.get("timing.speed_correction", 80))
+        # .get 默认值统一引用 DEFAULT_SETTINGS（唯一真源），避免三处漂移
+        _defaults = AppSettings.DEFAULT_SETTINGS
+        self.card_speed_correction.setValue(
+            s.get("timing.speed_correction", _defaults["timing"]["speed_correction"])
+        )
         self.card_export_offset.setValue(s.get("export.offset_ms", 0))
         self.card_timing_step.setValue(s.get("timing.timing_adjust_step_ms", 10))
         refresh_fps = s.get("timing.ui_refresh_fps", 60)
@@ -301,7 +306,9 @@ class TimingSubInterface(SubSettingInterface):
         self.card_disable_click_recenter.setChecked(s.get("timing.disable_click_recenter", False))
         self.card_hide_hitbox_highlights.setChecked(s.get("timing.hide_hitbox_highlights", False))
         self.card_preview_guide.setChecked(s.get("timing.preview_guide_enabled", False))
-        self.card_keysound.setChecked(s.get("timing.keysound_enabled", True))
+        self.card_keysound.setChecked(
+            s.get("timing.keysound_enabled", _defaults["timing"]["keysound_enabled"])
+        )
         self.card_keysound_volume.setValue(s.get("timing.keysound_volume", 100))
         style = s.get("timing.keysound_style", "default")
         idx = self._STYLE_KEYS.index(style) if style in self._STYLE_KEYS else 0

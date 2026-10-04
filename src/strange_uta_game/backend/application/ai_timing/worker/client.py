@@ -160,8 +160,14 @@ class AlignmentWorkerClient:
             raise AlignmentWorkerError(
                 "未配置对齐运行环境：请先在弹窗中「安装 / 修复」后再执行"
             )
-        self._cancel_requested.clear()
+        # 注意：这里绝不 clear 取消标志（G10）——启动窗口期的 cancel()
+        #（proc 尚为 None，cancel() 只置标志不发送）若在此被 clear 会
+        # 整体丢失；run() 会在 align 消息后据此补发 cancel。client 为
+        # 一次性对象，标志不存在跨任务复用语义。
         self._finished.clear()
+        # 重启前先回收上一轮的 stderr 临时文件（覆盖式打开会让旧句柄
+        # 永久泄漏在 %TEMP%）
+        self._discard_stderr_file()
         try:
             # stderr 落临时文件而非 DEVNULL：worker 崩溃时把 traceback 尾部
             # 并入错误消息，彻底告别「返回码 1」式静默失败
@@ -214,6 +220,8 @@ class AlignmentWorkerClient:
                 **hidden_subprocess_kwargs(),
             )
         except OSError as exc:
+            # 启动失败同样回收刚创建的 stderr 临时文件
+            self._discard_stderr_file()
             raise AlignmentWorkerError(f"无法启动对齐进程：{exc}") from exc
         return self._proc
 
@@ -269,6 +277,12 @@ class AlignmentWorkerClient:
                 },
             }
         )
+        if self._cancel_requested.is_set():
+            # 启动窗口期的 cancel()（G10）：进程尚未启动时 cancel() 只能
+            # 置标志、无法送达——_ensure_started 不会 clear 已置位的标志，
+            # 这里在 align 消息之后补发 cancel（worker 的取消读线程在
+            # provider.load 后启动，会在首个阶段边界命中）
+            self._send({"type": "cancel"})
 
         try:
             assert proc.stdout is not None
@@ -350,18 +364,28 @@ class AlignmentWorkerClient:
         except OSError:
             pass
 
+    def _discard_stderr_file(self) -> None:
+        """关闭并删除 stderr 临时文件（幂等，防 %TEMP% 无限累积）。"""
+        stderr_file = getattr(self, "_stderr_file", None)
+        if stderr_file is None:
+            return
+        self._stderr_file = None
+        name = getattr(stderr_file, "name", "")
+        try:
+            stderr_file.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
     def close(self) -> None:
         """回收进程与管道（幂等）。"""
         proc = self._proc
         self._proc = None
         self._kill_tree(proc)
-        stderr_file = getattr(self, "_stderr_file", None)
-        if stderr_file is not None:
-            self._stderr_file = None
-            try:
-                stderr_file.close()
-            except Exception:
-                pass
+        self._discard_stderr_file()
         if proc is None:
             return
         for stream in (proc.stdin, proc.stdout):
