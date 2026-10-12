@@ -1,7 +1,7 @@
 {
-  "version": "1.7.0",
-  "content_hash": "6715576f55f8efac85c96f25ccd50eeba9990f7ca178cf766b6bb2b203d51e70",
-  "size": 130966609,
+  "version": "1.7.2",
+  "content_hash": "f37bb3aa0fe8a370d033b798c3c5dbb567e92c790d8d9568e88cfa0d82c8299e",
+  "size": 130966790,
   "requirements_hash": "5620b926163241250568e93d93990a70762fdfa89cf9e3d25e065179dfed7a50",
   "req_lines": [
     "PyQt6==6.11.0",
